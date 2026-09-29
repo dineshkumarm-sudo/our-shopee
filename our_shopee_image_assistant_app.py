@@ -1,444 +1,394 @@
-import io
-import os
-import zipfile
-import pandas as pd
 import streamlit as st
-from PIL import Image, ImageEnhance, ImageOps
+import streamlit.components.v1 as components
 
-# ---------------------------------------------------------
-# 1. Page Config & Layout
-# ---------------------------------------------------------
+# 1. Page Configuration
 st.set_page_config(
     page_title="Our Shopee Image Assistant",
     page_icon="✨",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
-# ---------------------------------------------------------
-# 2. Styling (Force Light Mode & Apple Aesthetic)
-# ---------------------------------------------------------
-st.markdown(
-    """
+# 2. Inject HTML Canvas Tool into Streamlit
+HTML_CONTENT = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Our Shopee Image Assistant</title>
+
+    <!-- Tailwind CSS for high contrast & clean styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- JSZip for client-side batch download -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
+    <!-- SheetJS (xlsx) for Excel Audit Log export -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
     <style>
-    /* Force Light Mode Global Background & Colors */
-    html, body, [data-testid="stAppViewContainer"], .stApp {
-        background-color: #FAFAFA !important;
-        color: #1F2937 !important;
-        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif !important;
-    }
-
-    /* Force text elements to dark gray/black */
-    p, span, label, h1, h2, h3, h4, h5, h6, div {
-        color: #1F2937;
-    }
-    
-    /* Header Card */
-    .header-card {
-        background: #FFFFFF !important;
-        border: 1px solid rgba(0, 0, 0, 0.08) !important;
-        padding: 2rem 2rem;
-        border-radius: 24px;
-        text-align: center;
-        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.03);
-        margin-bottom: 2rem;
-    }
-    
-    .header-title {
-        font-size: 2.3rem;
-        font-weight: 700;
-        letter-spacing: -0.02em;
-        background: linear-gradient(135deg, #10B981 0%, #FF6B00 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 0.4rem;
-    }
-    
-    .header-subtitle {
-        color: #6E6E73 !important;
-        font-size: 1.05rem;
-        margin-bottom: 1rem;
-    }
-
-    .specs-container {
-        display: flex;
-        justify-content: center;
-        gap: 10px;
-        flex-wrap: wrap;
-    }
-    
-    .spec-chip-green {
-        background-color: rgba(16, 185, 129, 0.1);
-        color: #059669 !important;
-        padding: 6px 14px;
-        border-radius: 20px;
-        font-size: 0.85rem;
-        font-weight: 600;
-        border: 1px solid rgba(16, 185, 129, 0.2);
-    }
-
-    .spec-chip-orange {
-        background-color: rgba(255, 107, 0, 0.1);
-        color: #D95300 !important;
-        padding: 6px 14px;
-        border-radius: 20px;
-        font-size: 0.85rem;
-        font-weight: 600;
-        border: 1px solid rgba(255, 107, 0, 0.2);
-    }
-
-    /* Metric Cards */
-    .metric-card {
-        background: #FFFFFF !important;
-        border-radius: 18px;
-        padding: 1.2rem;
-        border: 1px solid #E5E7EB !important;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.02);
-        text-align: center;
-    }
-    .metric-value {
-        font-size: 1.8rem;
-        font-weight: 700;
-        color: #1F2937 !important;
-        margin-top: 0.2rem;
-    }
-    .metric-label {
-        font-size: 0.82rem;
-        color: #6B7280 !important;
-        font-weight: 500;
-        text-transform: uppercase;
-        letter-spacing: 0.03em;
-    }
-
-    /* File Uploader Container */
-    [data-testid="stFileUploader"] {
-        background: #FFFFFF !important;
-        border-radius: 20px !important;
-        padding: 1.5rem;
-        border: 2px dashed #D1D5DB !important;
-        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.02);
-    }
-
-    /* Action Buttons */
-    .stDownloadButton > button {
-        background: linear-gradient(135deg, #10B981 0%, #059669 100%) !important;
-        color: #FFFFFF !important;
-        border-radius: 14px !important;
-        border: none !important;
-        padding: 0.6rem 1.4rem !important;
-        font-weight: 600 !important;
-        box-shadow: 0 4px 14px rgba(16, 185, 129, 0.3) !important;
-    }
-
-    /* Ensure tables render cleanly in light theme */
-    [data-testid="stDataFrame"] {
-        background-color: #FFFFFF !important;
-        border-radius: 12px;
-    }
-    
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
+        body {
+            background-color: #f8fafc;
+            color: #0f172a;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+        .drag-over {
+            border-color: #059669 !important;
+            background-color: #ecfdf5 !important;
+        }
     </style>
-""",
-    unsafe_allow_html=True,
-)
+</head>
+<body class="p-4 md:p-8">
 
+    <!-- App Container -->
+    <div class="max-w-7xl mx-auto space-y-6">
 
-# ---------------------------------------------------------
-# 3. Processing Core Functions
-# ---------------------------------------------------------
-def extract_images_from_input(uploaded_files):
-    """Extracts raw images from uploaded image files or ZIP archives."""
-    extracted_images = []
-
-    for file_obj in uploaded_files:
-        filename = file_obj.name.lower()
-
-        if filename.endswith(".zip"):
-            try:
-                with zipfile.ZipFile(file_obj, "r") as z:
-                    for zip_info in z.infolist():
-                        if not zip_info.is_dir() and not zip_info.filename.startswith(
-                            "__MACOSX"
-                        ):
-                            ext = zip_info.filename.rsplit(".", 1)[-1].lower()
-                            if ext in ["png", "jpg", "jpeg", "webp", "bmp", "tiff"]:
-                                img_bytes = z.read(zip_info.filename)
-                                base_name = os.path.basename(zip_info.filename)
-                                extracted_images.append(
-                                    (base_name, io.BytesIO(img_bytes))
-                                )
-            except Exception as e:
-                st.error(f"Error reading ZIP file {file_obj.name}: {e}")
-
-        elif filename.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff")):
-            extracted_images.append((file_obj.name, file_obj))
-
-    return extracted_images
-
-
-def process_and_upscale_image(
-    image_bytes_io, target_size=(1000, 1000), max_kb=49.0, bg_color=(255, 255, 255)
-):
-    """
-    Quality-First Image Processor:
-    - Maintains sharp product details & color precision (subsampling=0).
-    - Preserves aspect ratio with white canvas padding.
-    - Upscales <600px images with intelligent detail sharpening.
-    - Guarantees strictly < 49 KB output without visual degradation.
-    """
-    img = Image.open(image_bytes_io)
-    img = ImageOps.exif_transpose(img)
-    orig_w, orig_h = img.size
-
-    was_upscaled = orig_w < 600 or orig_h < 600
-
-    if img.mode in ("RGBA", "P", "CMYK"):
-        if img.mode == "RGBA":
-            background = Image.new("RGB", img.size, bg_color)
-            background.paste(img, mask=img.split()[3])
-            img = background
-        else:
-            img = img.convert("RGB")
-
-    if was_upscaled:
-        scale_factor = max(600 / orig_w, 600 / orig_h)
-        new_w = int(orig_w * scale_factor)
-        new_h = int(orig_h * scale_factor)
-        img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        enhancer = ImageEnhance.Sharpness(img)
-        img = enhancer.enhance(1.25)
-
-    working_img = img.copy()
-    working_img.thumbnail(target_size, Image.Resampling.LANCZOS)
-
-    final_canvas = Image.new("RGB", target_size, bg_color)
-    paste_x = (target_size[0] - working_img.width) // 2
-    paste_y = (target_size[1] - working_img.height) // 2
-    final_canvas.paste(working_img, (paste_x, paste_y))
-
-    buffer = io.BytesIO()
-
-    quality = 92
-    quality_floor = 65
-
-    while quality >= quality_floor:
-        buffer.seek(0)
-        buffer.truncate(0)
-        final_canvas.save(
-            buffer,
-            format="WEBP",
-            quality=quality,
-            optimize=True,
-            method=6,
-            subsampling=0,
-        )
-        size_kb = buffer.tell() / 1024.0
-
-        if size_kb < max_kb:
-            break
-        quality -= 3
-
-    if size_kb >= max_kb:
-        padding_scales = [0.94, 0.88, 0.82]
-
-        for scale in padding_scales:
-            fit_size = (int(1000 * scale), int(1000 * scale))
-            scaled_img = img.copy()
-            scaled_img.thumbnail(fit_size, Image.Resampling.LANCZOS)
-
-            final_canvas = Image.new("RGB", target_size, bg_color)
-            px = (target_size[0] - scaled_img.width) // 2
-            py = (target_size[1] - scaled_img.height) // 2
-            final_canvas.paste(scaled_img, (px, py))
-
-            quality = 85
-            while quality >= 60:
-                buffer.seek(0)
-                buffer.truncate(0)
-                final_canvas.save(
-                    buffer,
-                    format="WEBP",
-                    quality=quality,
-                    optimize=True,
-                    method=6,
-                    subsampling=0,
-                )
-                size_kb = buffer.tell() / 1024.0
-
-                if size_kb < max_kb:
-                    break
-                quality -= 5
-
-            if size_kb < max_kb:
-                break
-
-    buffer.seek(0)
-    return {
-        "buffer": buffer,
-        "size_kb": size_kb,
-        "quality": quality,
-        "orig_size": f"{orig_w}x{orig_h}",
-        "was_upscaled": was_upscaled,
-        "under_50kb": size_kb < 50.0,
-    }
-
-
-# ---------------------------------------------------------
-# 4. Header Section
-# ---------------------------------------------------------
-st.markdown(
-    """
-    <div class="header-card">
-        <div class="header-title">Our Shopee Image Assistant</div>
-        <p class="header-subtitle">Automated WebP conversion, aspect-ratio safe 1000x1000 canvas padding, & <600px detail upscaling.</p>
-        <div class="specs-container">
-            <span class="spec-chip-green">📐 1000 x 1000 Canvas</span>
-            <span class="spec-chip-orange">⚡ Exact Name .WEBP</span>
-            <span class="spec-chip-green">📦 &lt; 49 KB Strict Size</span>
-            <span class="spec-chip-orange">🔍 &lt; 600px Auto-Upscaler</span>
+        <!-- Header Card -->
+        <div class="bg-white border border-slate-200 rounded-2xl p-6 text-center shadow-sm">
+            <h1 class="text-3xl font-extrabold bg-gradient-to-r from-emerald-600 to-amber-600 bg-clip-text text-transparent">
+                Our Shopee Image Assistant
+            </h1>
+            <p class="text-slate-600 text-sm md:text-base mt-2">
+                Automated WebP conversion, aspect-ratio safe 1000x1000 canvas padding, & &lt;600px detail upscaling.
+            </p>
+            <div class="flex flex-wrap justify-center gap-2 mt-4">
+                <span class="bg-emerald-50 text-emerald-700 text-xs font-semibold px-3 py-1 rounded-full border border-emerald-200">
+                    📐 1000 x 1000 Canvas
+                </span>
+                <span class="bg-amber-50 text-amber-700 text-xs font-semibold px-3 py-1 rounded-full border border-amber-200">
+                    ⚡ Exact Name .WEBP
+                </span>
+                <span class="bg-emerald-50 text-emerald-700 text-xs font-semibold px-3 py-1 rounded-full border border-emerald-200">
+                    📦 &lt; 49 KB Strict Size
+                </span>
+                <span class="bg-amber-50 text-amber-700 text-xs font-semibold px-3 py-1 rounded-full border border-amber-200">
+                    🔍 &lt; 600px Auto-Upscaler
+                </span>
+            </div>
         </div>
+
+        <!-- Upload Zone -->
+        <div id="dropzone" class="bg-white border-2 border-dashed border-slate-300 rounded-2xl p-8 text-center shadow-sm transition-all duration-200 cursor-pointer hover:border-emerald-500">
+            <input type="file" id="fileInput" multiple accept="image/*,.zip" class="hidden">
+            <div class="space-y-3">
+                <div class="w-14 h-14 mx-auto bg-emerald-50 rounded-full flex items-center justify-center text-emerald-600 text-2xl">
+                    📁
+                </div>
+                <div class="text-slate-800 font-bold text-lg">
+                    Click to browse or drag & drop images or ZIP file here
+                </div>
+                <div class="text-slate-500 text-xs font-medium">
+                    Supports PNG, JPG, JPEG, WEBP, BMP, and ZIP archives
+                </div>
+            </div>
+        </div>
+
+        <!-- Progress Indicator -->
+        <div id="progressContainer" class="hidden bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
+            <div class="flex justify-between items-center mb-2">
+                <span id="progressText" class="text-sm font-semibold text-slate-800">Processing images...</span>
+                <span id="progressPercent" class="text-sm font-bold text-emerald-600">0%</span>
+            </div>
+            <div class="w-full bg-slate-100 rounded-full h-2.5 overflow-hidden">
+                <div id="progressBar" class="bg-emerald-600 h-2.5 rounded-full transition-all duration-200" style="width: 0%"></div>
+            </div>
+        </div>
+
+        <!-- Metrics Dashboard -->
+        <div id="dashboard" class="hidden grid grid-cols-2 md:grid-cols-5 gap-3">
+            <div class="bg-white border border-slate-200 rounded-xl p-4 text-center shadow-sm">
+                <div class="text-xs font-bold uppercase text-slate-500 tracking-wider">Total Loaded</div>
+                <div id="statTotal" class="text-2xl font-extrabold text-slate-900 mt-1">0</div>
+            </div>
+            <div class="bg-white border border-slate-200 rounded-xl p-4 text-center shadow-sm">
+                <div class="text-xs font-bold uppercase text-slate-500 tracking-wider">1000x1000 Canvas</div>
+                <div id="statCanvas" class="text-2xl font-extrabold text-emerald-600 mt-1">0</div>
+            </div>
+            <div class="bg-white border border-slate-200 rounded-xl p-4 text-center shadow-sm">
+                <div class="text-xs font-bold uppercase text-slate-500 tracking-wider">WebP Format</div>
+                <div id="statWebp" class="text-2xl font-extrabold text-emerald-600 mt-1">0</div>
+            </div>
+            <div class="bg-white border border-slate-200 rounded-xl p-4 text-center shadow-sm">
+                <div class="text-xs font-bold uppercase text-slate-500 tracking-wider">Under 50 KB</div>
+                <div id="statUnder50" class="text-2xl font-extrabold text-emerald-600 mt-1">0</div>
+            </div>
+            <div class="bg-white border border-slate-200 rounded-xl p-4 text-center shadow-sm col-span-2 md:col-span-1">
+                <div class="text-xs font-bold uppercase text-slate-500 tracking-wider">Upscaled (&lt;600px)</div>
+                <div id="statUpscaled" class="text-2xl font-extrabold text-amber-600 mt-1">0</div>
+            </div>
+        </div>
+
+        <!-- Actions / Downloads -->
+        <div id="actionsContainer" class="hidden flex flex-col sm:flex-row gap-3">
+            <button id="downloadZipBtn" class="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3 px-6 rounded-xl shadow-md transition-all flex items-center justify-center gap-2">
+                <span>📦</span> Download All Optimized (.ZIP)
+            </button>
+            <button id="downloadExcelBtn" class="flex-1 bg-slate-800 hover:bg-slate-900 text-white font-bold py-3 px-6 rounded-xl shadow-md transition-all flex items-center justify-center gap-2">
+                <span>📊</span> Download Batch Audit Log (.XLSX)
+            </button>
+        </div>
+
+        <!-- Data Log Table -->
+        <div id="tableContainer" class="hidden bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+            <div class="p-4 bg-slate-50 border-b border-slate-200 font-bold text-slate-800">
+                Audit Log & Image Preview
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left border-collapse text-xs md:text-sm">
+                    <thead>
+                        <tr class="bg-slate-100 text-slate-700 font-bold border-b border-slate-200">
+                            <th class="p-3">Preview</th>
+                            <th class="p-3">Original Name</th>
+                            <th class="p-3">Output WebP</th>
+                            <th class="p-3">Original Size</th>
+                            <th class="p-3">Final Canvas</th>
+                            <th class="p-3">Size (KB)</th>
+                            <th class="p-3">Quality</th>
+                            <th class="p-3">&lt; 50 KB</th>
+                            <th class="p-3">Upscaled</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tableBody" class="divide-y divide-slate-200 text-slate-800">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
     </div>
-""",
-    unsafe_allow_html=True,
-)
 
+    <!-- Processing Logic -->
+    <script>
+        const dropzone = document.getElementById('dropzone');
+        const fileInput = document.getElementById('fileInput');
+        const progressContainer = document.getElementById('progressContainer');
+        const progressBar = document.getElementById('progressBar');
+        const progressText = document.getElementById('progressText');
+        const progressPercent = document.getElementById('progressPercent');
+        const dashboard = document.getElementById('dashboard');
+        const actionsContainer = document.getElementById('actionsContainer');
+        const tableContainer = document.getElementById('tableContainer');
+        const tableBody = document.getElementById('tableBody');
 
-# ---------------------------------------------------------
-# 5. File Upload Interface
-# ---------------------------------------------------------
-uploaded_files = st.file_uploader(
-    "Upload files",
-    type=["png", "jpg", "jpeg", "webp", "zip"],
-    accept_multiple_files=True,
-    label_visibility="collapsed",
-)
+        const statTotal = document.getElementById('statTotal');
+        const statCanvas = document.getElementById('statCanvas');
+        const statWebp = document.getElementById('statWebp');
+        const statUnder50 = document.getElementById('statUnder50');
+        const statUpscaled = document.getElementById('statUpscaled');
 
-if uploaded_files:
-    raw_images = extract_images_from_input(uploaded_files)
+        let processedFiles = [];
 
-    if raw_images:
-        processed_data = []
-        zip_buffer = io.BytesIO()
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        dropzone.addEventListener('click', () => fileInput.click());
 
-        with zipfile.ZipFile(
-            zip_buffer, "w", zipfile.ZIP_DEFLATED
-        ) as zip_file:
-            total_count = len(raw_images)
+        ['dragenter', 'dragover'].forEach(name => {
+            dropzone.addEventListener(name, (e) => {
+                e.preventDefault();
+                dropzone.classList.add('drag-over');
+            });
+        });
 
-            for idx, (orig_filename, img_source) in enumerate(raw_images):
-                status_text.text(
-                    f"Processing image {idx + 1} of {total_count}: {orig_filename}"
-                )
+        ['dragleave', 'drop'].forEach(name => {
+            dropzone.addEventListener(name, (e) => {
+                e.preventDefault();
+                dropzone.classList.remove('drag-over');
+            });
+        });
 
-                result = process_and_upscale_image(img_source)
+        dropzone.addEventListener('drop', (e) => {
+            const files = e.dataTransfer.files;
+            if (files.length) handleFiles(files);
+        });
 
-                base_name = os.path.splitext(orig_filename)[0]
-                exact_webp_filename = f"{base_name}.webp"
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length) handleFiles(e.target.files);
+        });
 
-                zip_file.writestr(
-                    exact_webp_filename, result["buffer"].getvalue()
-                )
+        async function handleFiles(files) {
+            const fileList = [];
 
-                processed_data.append(
-                    {
-                        "Original Name": orig_filename,
-                        "Output WebP Name": exact_webp_filename,
-                        "Original Resolution": result["orig_size"],
-                        "Final Canvas": "1000x1000",
-                        "Format": "WEBP",
-                        "Final Size (KB)": round(result["size_kb"], 2),
-                        "Quality Level (%)": result["quality"],
-                        "Under 50 KB": "Yes"
-                        if result["under_50kb"]
-                        else "No",
-                        "Upscaled (< 600px)": "Yes"
-                        if result["was_upscaled"]
-                        else "No",
-                        "buffer": result["buffer"],
+            for (let file of files) {
+                if (file.name.toLowerCase().endsWith('.zip')) {
+                    const zip = await JSZip.loadAsync(file);
+                    for (let relativePath in zip.files) {
+                        const zipEntry = zip.files[relativePath];
+                        if (!zipEntry.dir && !relativePath.startsWith('__MACOSX')) {
+                            const ext = relativePath.split('.').pop().toLowerCase();
+                            if (['png', 'jpg', 'jpeg', 'webp', 'bmp'].includes(ext)) {
+                                const blob = await zipEntry.async('blob');
+                                const filename = relativePath.split('/').pop();
+                                fileList.push(new File([blob], filename, { type: `image/${ext}` }));
+                            }
+                        }
                     }
-                )
+                } else if (file.type.startsWith('image/')) {
+                    fileList.push(file);
+                }
+            }
 
-                progress_bar.progress((idx + 1) / total_count)
+            if (!fileList.length) return;
 
-        status_text.success("✅ Batch processing completed!")
-        zip_buffer.seek(0)
+            processedFiles = [];
+            tableBody.innerHTML = '';
+            progressContainer.classList.remove('hidden');
 
-        # ---------------------------------------------------------
-        # 6. Real-time Dashboard Stats
-        # ---------------------------------------------------------
-        total_loaded = len(processed_data)
-        converted_res = total_loaded
-        converted_webp = total_loaded
-        under_50kb_count = sum(
-            1 for item in processed_data if item["Under 50 KB"] == "Yes"
-        )
-        upscaled_count = sum(
-            1 for item in processed_data if item["Upscaled (< 600px)"] == "Yes"
-        )
+            for (let i = 0; i < fileList.length; i++) {
+                const file = fileList[i];
+                const pct = Math.round(((i + 1) / fileList.length) * 100);
+                progressText.innerText = `Processing ${i + 1} of ${fileList.length}: ${file.name}`;
+                progressPercent.innerText = `${pct}%`;
+                progressBar.style.width = `${pct}%`;
 
-        st.markdown("<h4 style='color:#1F2937;'>📊 Processing Dashboard</h4>", unsafe_allow_html=True)
-        m1, m2, m3, m4, m5 = st.columns(5)
+                const result = await processImage(file);
+                processedFiles.push(result);
+                renderTableRow(result);
+            }
 
-        with m1:
-            st.markdown(
-                f"""<div class="metric-card"><div class="metric-label">Total Loaded</div><div class="metric-value">{total_loaded}</div></div>""",
-                unsafe_allow_html=True,
-            )
-        with m2:
-            st.markdown(
-                f"""<div class="metric-card"><div class="metric-label">1000x1000 Canvas</div><div class="metric-value" style="color:#10B981;">{converted_res}</div></div>""",
-                unsafe_allow_html=True,
-            )
-        with m3:
-            st.markdown(
-                f"""<div class="metric-card"><div class="metric-label">WebP Converted</div><div class="metric-value" style="color:#10B981;">{converted_webp}</div></div>""",
-                unsafe_allow_html=True,
-            )
-        with m4:
-            st.markdown(
-                f"""<div class="metric-card"><div class="metric-label">Under 50 KB</div><div class="metric-value" style="color:#10B981;">{under_50kb_count}</div></div>""",
-                unsafe_allow_html=True,
-            )
-        with m5:
-            color = "#FF6B00" if upscaled_count > 0 else "#6B7280"
-            st.markdown(
-                f"""<div class="metric-card"><div class="metric-label">Upscaled (&lt;600px)</div><div class="metric-value" style="color:{color};">{upscaled_count}</div></div>""",
-                unsafe_allow_html=True,
-            )
+            progressText.innerText = '✅ Batch processing complete!';
+            updateDashboard();
 
-        st.divider()
+            dashboard.classList.remove('hidden');
+            actionsContainer.classList.remove('hidden');
+            tableContainer.classList.remove('hidden');
+        }
 
-        # ---------------------------------------------------------
-        # 7. Downloads & Excel Audit Log
-        # ---------------------------------------------------------
-        st.markdown("<h4 style='color:#1F2937;'>📥 Downloads & Audit Log</h4>", unsafe_allow_html=True)
-        d_col1, d_col2 = st.columns(2)
+        function processImage(file) {
+            return new Promise((resolve) => {
+                const img = new Image();
+                const url = URL.createObjectURL(file);
 
-        with d_col1:
-            st.download_button(
-                label="📦 Download All Optimized (.ZIP)",
-                data=zip_buffer,
-                file_name="Shopee_Optimized_Images.zip",
-                mime="application/zip",
-                use_container_width=True,
-            )
+                img.onload = async () => {
+                    const origW = img.width;
+                    const origH = img.height;
+                    const wasUpscaled = origW < 600 || origH < 600;
 
-        df_log = pd.DataFrame(processed_data).drop(columns=["buffer"])
-        excel_buffer = io.BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            df_log.to_excel(writer, index=False, sheet_name="Image_Batch_Log")
-        excel_buffer.seek(0)
+                    let srcW = origW;
+                    let srcH = origH;
+                    let canvasSource = img;
 
-        with d_col2:
-            st.download_button(
-                label="📊 Download Batch Audit Log (.XLSX)",
-                data=excel_buffer,
-                file_name="Shopee_Image_Processing_Log.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+                    if (wasUpscaled) {
+                        const scale = Math.max(600 / origW, 600 / origH);
+                        srcW = Math.round(origW * scale);
+                        srcH = Math.round(origH * scale);
 
-        st.markdown("<h5 style='color:#1F2937; margin-top:20px;'>Audit Log Preview</h5>", unsafe_allow_html=True)
-        st.dataframe(df_log, use_container_width=True)
+                        const upCanvas = document.createElement('canvas');
+                        upCanvas.width = srcW;
+                        upCanvas.height = srcH;
+                        const uCtx = upCanvas.getContext('2d');
+                        uCtx.drawImage(img, 0, 0, srcW, srcH);
+
+                        canvasSource = upCanvas;
+                    }
+
+                    const canvas = document.createElement('canvas');
+                    canvas.width = 1000;
+                    canvas.height = 1000;
+                    const ctx = canvas.getContext('2d');
+
+                    ctx.fillStyle = '#FFFFFF';
+                    ctx.fillRect(0, 0, 1000, 1000);
+
+                    const scale = Math.min(1000 / srcW, 1000 / srcH);
+                    const fitW = srcW * scale;
+                    const fitH = srcH * scale;
+                    const pasteX = (1000 - fitW) / 2;
+                    const pasteY = (1000 - fitH) / 2;
+
+                    ctx.drawImage(canvasSource, pasteX, pasteY, fitW, fitH);
+
+                    let quality = 0.92;
+                    let blob = null;
+                    let sizeKB = 0;
+
+                    while (quality >= 0.60) {
+                        blob = await new Promise(res => canvas.toBlob(res, 'image/webp', quality));
+                        sizeKB = blob.size / 1024;
+                        if (sizeKB <= 49.0) break;
+                        quality -= 0.04;
+                    }
+
+                    const baseName = file.name.substring(0, file.name.lastIndexOf('.')) || file.name;
+                    const outputName = `${baseName}.webp`;
+                    const previewUrl = URL.createObjectURL(blob);
+
+                    URL.revokeObjectURL(url);
+
+                    resolve({
+                        origName: file.name,
+                        outputName: outputName,
+                        origSize: `${origW}x${origH}`,
+                        finalCanvas: '1000x1000',
+                        sizeKB: sizeKB.toFixed(2),
+                        quality: Math.round(quality * 100),
+                        under50: sizeKB <= 50.0,
+                        upscaled: wasUpscaled,
+                        blob: blob,
+                        previewUrl: previewUrl
+                    });
+                };
+
+                img.src = url;
+            });
+        }
+
+        function renderTableRow(item) {
+            const tr = document.createElement('tr');
+            tr.className = 'hover:bg-slate-50 transition-colors';
+            tr.innerHTML = `
+                <td class="p-3"><img src="${item.previewUrl}" class="w-10 h-10 object-cover rounded border border-slate-200 bg-white"></td>
+                <td class="p-3 font-medium text-slate-900">${item.origName}</td>
+                <td class="p-3 text-emerald-700 font-semibold">${item.outputName}</td>
+                <td class="p-3 text-slate-600">${item.origSize}</td>
+                <td class="p-3 text-slate-600">${item.finalCanvas}</td>
+                <td class="p-3 font-bold ${item.sizeKB <= 49 ? 'text-emerald-600' : 'text-rose-600'}">${item.sizeKB} KB</td>
+                <td class="p-3 text-slate-600">${item.quality}%</td>
+                <td class="p-3"><span class="px-2 py-0.5 rounded-full text-xs font-bold ${item.under50 ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800'}">${item.under50 ? 'Yes' : 'No'}</span></td>
+                <td class="p-3"><span class="px-2 py-0.5 rounded-full text-xs font-bold ${item.upscaled ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-600'}">${item.upscaled ? 'Yes' : 'No'}</span></td>
+            `;
+            tableBody.appendChild(tr);
+        }
+
+        function updateDashboard() {
+            statTotal.innerText = processedFiles.length;
+            statCanvas.innerText = processedFiles.length;
+            statWebp.innerText = processedFiles.length;
+            statUnder50.innerText = processedFiles.filter(f => f.under50).length;
+            statUpscaled.innerText = processedFiles.filter(f => f.upscaled).length;
+        }
+
+        document.getElementById('downloadZipBtn').addEventListener('click', async () => {
+            const zip = new JSZip();
+            processedFiles.forEach(file => {
+                zip.file(file.outputName, file.blob);
+            });
+            const content = await zip.generateAsync({ type: 'blob' });
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(content);
+            link.download = 'Shopee_Optimized_Images.zip';
+            link.click();
+        });
+
+        document.getElementById('downloadExcelBtn').addEventListener('click', () => {
+            const exportData = processedFiles.map(f => ({
+                'Original Name': f.origName,
+                'Output WebP Name': f.outputName,
+                'Original Resolution': f.origSize,
+                'Final Canvas': f.finalCanvas,
+                'Format': 'WEBP',
+                'Final Size (KB)': parseFloat(f.sizeKB),
+                'Quality Level (%)': f.quality,
+                'Under 50 KB': f.under50 ? 'Yes' : 'No',
+                'Upscaled (< 600px)': f.upscaled ? 'Yes' : 'No'
+            }));
+
+            const ws = XLSX.utils.json_to_sheet(exportData);
+            const wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, ws, "Image_Batch_Log");
+            XLSX.writeFile(wb, "Shopee_Image_Processing_Log.xlsx");
+        });
+    </script>
+</body>
+</html>
+"""
+
+# Render full screen component
+components.html(HTML_CONTENT, height=1200, scrolling=True)
