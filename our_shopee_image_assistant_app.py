@@ -18,7 +18,7 @@ import zipfile
 from urllib.parse import urlparse, urljoin
 
 import requests
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFilter
 
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 DOWNLOAD_TIMEOUT = (10, 30)
@@ -87,10 +87,14 @@ def _optimize_image_bytes(image_bytes, output_name):
     with Image.open(io.BytesIO(image_bytes)) as source:
         image = ImageOps.exif_transpose(source).convert("RGB")
         orig_w, orig_h = image.size
-        was_upscaled = orig_w < 600 or orig_h < 600
+        # Enlarge low-resolution images to at least 1000 px on their longest side.
+        # LANCZOS interpolation and mild sharpening improve perceived crispness but cannot recreate missing detail.
+        was_upscaled = max(orig_w, orig_h) < 1000 or min(orig_w, orig_h) < 600
         if was_upscaled:
-            scale = max(600 / orig_w, 600 / orig_h)
-            image = image.resize((round(orig_w * scale), round(orig_h * scale)), Image.Resampling.LANCZOS)
+            scale = 1000 / max(orig_w, orig_h)
+            if scale > 1:
+                image = image.resize((max(1, round(orig_w * scale)), max(1, round(orig_h * scale))), Image.Resampling.LANCZOS)
+                image = image.filter(ImageFilter.UnsharpMask(radius=1.2, percent=115, threshold=3))
 
         sample = image.copy()
         sample.thumbnail((100, 100), Image.Resampling.LANCZOS)
@@ -245,7 +249,7 @@ def _process_excel_server_side(uploaded_file):
         for item in output_rows:
             archive.writestr(item["name"], item["bytes"])
         audit_buffer = io.StringIO()
-        fields = ["Original Name", "Output WebP Name", "Original Resolution", "Final Canvas", "Format", "Final Size (KB)", "Quality Level (%)", "Under 50 KB", "Upscaled (< 600px)", "Content Scale (%)", "White Background Detected", "May Be Stretched", "Processing Comment"]
+        fields = ["Original Name", "Output WebP Name", "Original Resolution", "Final Canvas", "Format", "Final Size (KB)", "Quality Level (%)", "Under 50 KB", "Upscaled / Enhanced", "Content Scale (%)", "White Background Detected", "May Be Stretched", "Processing Comment"]
         writer = csv.DictWriter(audit_buffer, fieldnames=fields)
         writer.writeheader()
         for item in output_rows:
@@ -269,7 +273,7 @@ def _process_excel_server_side(uploaded_file):
 
 
 st.markdown("### Excel Image Import — Server-Side Download")
-st.caption("This mode downloads images from the server, so it can handle many URLs that browser-based downloads reject due to CORS. It applies the same 1000×1000 white canvas, small-image upscaling, WebP conversion, and compression target.")
+st.caption("This mode downloads images from the server, so it can handle many URLs that browser-based downloads reject due to CORS. Low-resolution images are enlarged with high-quality resampling and mild sharpening, then processed to a 1000×1000 canvas, WebP, and the compression target. Upscaling cannot restore detail missing from the original.")
 server_excel = st.file_uploader("Upload Excel/CSV with “Image link” and “Image name” columns", type=["xlsx", "xlsm", "csv"], key="server_excel_upload")
 if server_excel is not None and st.button("Download and Optimize Excel Images", type="primary", key="server_excel_process"):
     try:
@@ -327,7 +331,8 @@ HTML_CONTENT = """
                 Our Shopee Image Assistant
             </h1>
             <p class="text-slate-600 text-sm md:text-base mt-2">
-                Automated WebP conversion, aspect-ratio safe 1000x1000 canvas padding, & &lt;600px detail upscaling.
+                Automated WebP conversion, 1000x1000 canvas processing, and high-quality upscaling for low-resolution images.
+                Upscaling improves presentation but cannot fully restore missing source detail.
             </p>
             <div class="flex flex-wrap justify-center gap-2 mt-4">
                 <span class="bg-emerald-50 text-emerald-700 text-xs font-semibold px-3 py-1 rounded-full border border-emerald-200">
@@ -340,7 +345,7 @@ HTML_CONTENT = """
                     📦 &lt; 49 KB Strict Size
                 </span>
                 <span class="bg-amber-50 text-amber-700 text-xs font-semibold px-3 py-1 rounded-full border border-amber-200">
-                    🔍 &lt; 600px Auto-Upscaler
+                    🔍 Low-Resolution Upscaling
                 </span>
             </div>
         </div>
@@ -721,17 +726,21 @@ HTML_CONTENT = """
                     let canvasSource = img;
 
                     if (wasUpscaled) {
-                        const scale = Math.max(600 / origW, 600 / origH);
-                        srcW = Math.round(origW * scale);
-                        srcH = Math.round(origH * scale);
-
-                        const upCanvas = document.createElement('canvas');
-                        upCanvas.width = srcW;
-                        upCanvas.height = srcH;
-                        const uCtx = upCanvas.getContext('2d');
-                        uCtx.drawImage(img, 0, 0, srcW, srcH);
-
-                        canvasSource = upCanvas;
+                        // Enlarge low-resolution images to 1000 px on their longest side.
+                        // Interpolation improves size/smoothness but cannot invent missing detail.
+                        const scale = 1000 / Math.max(origW, origH);
+                        if (scale > 1) {
+                            srcW = Math.max(1, Math.round(origW * scale));
+                            srcH = Math.max(1, Math.round(origH * scale));
+                            const upCanvas = document.createElement('canvas');
+                            upCanvas.width = srcW;
+                            upCanvas.height = srcH;
+                            const uCtx = upCanvas.getContext('2d');
+                            uCtx.imageSmoothingEnabled = true;
+                            uCtx.imageSmoothingQuality = 'high';
+                            uCtx.drawImage(img, 0, 0, srcW, srcH);
+                            canvasSource = upCanvas;
+                        }
                     }
 
                     const canvas = document.createElement('canvas');
