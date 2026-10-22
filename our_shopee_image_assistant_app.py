@@ -278,7 +278,7 @@ if server_excel is not None and st.button("Download and Optimize Excel Images", 
             with st.expander(f"View failed rows ({len(failed_rows)})"):
                 st.text("\n".join(failed_rows))
         if successful_images:
-            st.dataframe([{"Output Name": item["name"], "Original Resolution": item["original_resolution"], "Size (KB)": item["size_kb"], "Quality": item["quality"], "Upscaled": item["upscaled"]} for item in successful_images], use_container_width=True)
+            st.dataframe([{"Output Name": item["name"], "Original Resolution": item["original_resolution"], "Final Canvas": item["final_canvas"], "Size (KB)": item["size_kb"], "Quality": item["quality"], "Upscaled": item["upscaled"], "White Background": item["white_background_detected"], "May Be Stretched": item["may_be_stretched"], "Comment": item["background_note"]} for item in successful_images], use_container_width=True)
     except Exception as exc:
         st.error(f"Could not process this spreadsheet: {exc}")
 
@@ -440,6 +440,7 @@ HTML_CONTENT = """
                             <th class="p-3">Quality</th>
                             <th class="p-3">&lt; 50 KB</th>
                             <th class="p-3">Upscaled</th>
+                            <th class="p-3">Background / Stretch Note</th>
                         </tr>
                     </thead>
                     <tbody id="tableBody" class="divide-y divide-slate-200 text-slate-800">
@@ -824,6 +825,9 @@ HTML_CONTENT = """
                         under50: blob.size <= 49 * 1024,
                         upscaled: wasUpscaled,
                         contentScale: Math.round(contentScale * 100),
+                        whiteBackgroundDetected: hasWhiteBackground,
+                        mayBeStretched: mayBeStretched,
+                        backgroundNote: backgroundNote,
                         blob: blob,
                         previewUrl: previewUrl
                     });
@@ -846,6 +850,7 @@ HTML_CONTENT = """
                 <td class="p-3 text-slate-600">${item.quality}%</td>
                 <td class="p-3"><span class="px-2 py-0.5 rounded-full text-xs font-bold ${item.under50 ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800'}">${item.under50 ? 'Yes' : 'No'}</span></td>
                 <td class="p-3"><span class="px-2 py-0.5 rounded-full text-xs font-bold ${item.upscaled ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-600'}">${item.upscaled ? 'Yes' : 'No'}</span></td>
+                <td class="p-3 ${item.mayBeStretched ? 'text-rose-700 font-semibold' : 'text-slate-600'}">${item.backgroundNote}</td>
             `;
             tableBody.appendChild(tr);
         }
@@ -880,7 +885,10 @@ HTML_CONTENT = """
                 'Final Size (KB)': parseFloat(f.sizeKB),
                 'Quality Level (%)': f.quality,
                 'Under 50 KB': f.under50 ? 'Yes' : 'No',
-                'Upscaled (< 600px)': f.upscaled ? 'Yes' : 'No'
+                'Upscaled (< 600px)': f.upscaled ? 'Yes' : 'No',
+                'White Background Detected': f.whiteBackgroundDetected ? 'Yes' : 'No',
+                'May Be Stretched': f.mayBeStretched ? 'Yes' : 'No',
+                'Processing Comment': f.backgroundNote
             }));
 
             const ws = XLSX.utils.json_to_sheet(exportData);
