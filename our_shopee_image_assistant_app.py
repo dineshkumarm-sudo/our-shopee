@@ -9,6 +9,213 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# Server-side Excel import: bypasses browser CORS restrictions for image URLs.
+import csv
+import io
+import ipaddress
+import socket
+import zipfile
+from urllib.parse import urlparse, urljoin
+
+import requests
+from PIL import Image, ImageOps
+
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+DOWNLOAD_TIMEOUT = (10, 30)
+MAX_REDIRECTS = 5
+
+
+def _validate_public_url(url):
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("Only valid HTTP/HTTPS image URLs are supported.")
+    host = parsed.hostname.lower().rstrip(".")
+    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+        raise ValueError("Local network URLs are not allowed.")
+    try:
+        addresses = [ipaddress.ip_address(host.strip("[]"))]
+    except ValueError:
+        try:
+            addresses = [ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)]
+        except socket.gaierror as exc:
+            raise ValueError("Could not resolve the image host.") from exc
+    if not addresses or any(not addr.is_global for addr in addresses):
+        raise ValueError("Private or non-public network addresses are not allowed.")
+    return parsed
+
+
+def _download_image(url):
+    current_url = url
+    headers = {"User-Agent": "OurShopeeImageAssistant/1.0"}
+    for _ in range(MAX_REDIRECTS + 1):
+        parsed = _validate_public_url(current_url)
+        with requests.get(current_url, headers=headers, timeout=DOWNLOAD_TIMEOUT, stream=True, allow_redirects=False) as response:
+            if response.is_redirect or response.is_permanent_redirect:
+                location = response.headers.get("Location")
+                if not location:
+                    raise ValueError("Image host returned a redirect without a destination.")
+                current_url = urljoin(current_url, location)
+                continue
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "").split(";")[0].lower()
+            if content_type and not content_type.startswith("image/"):
+                raise ValueError("The URL did not return an image (Content-Type: " + content_type + ").")
+            chunks = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_IMAGE_BYTES:
+                    raise ValueError("Image exceeds the 20 MB download limit.")
+                chunks.append(chunk)
+            data = b"".join(chunks)
+            if not data:
+                raise ValueError("Downloaded file is empty.")
+            return data
+    raise ValueError("Image URL exceeded the redirect limit.")
+
+
+def _safe_output_name(value, fallback):
+    name = str(value or "").strip()
+    name = __import__("re").sub(r"\.[^./\\]+$", "", name)
+    name = __import__("re").sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).rstrip(". ").strip()
+    return name or fallback
+
+
+def _optimize_image_bytes(image_bytes, output_name):
+    with Image.open(io.BytesIO(image_bytes)) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        orig_w, orig_h = image.size
+        was_upscaled = orig_w < 600 or orig_h < 600
+        if was_upscaled:
+            scale = max(600 / orig_w, 600 / orig_h)
+            image = image.resize((round(orig_w * scale), round(orig_h * scale)), Image.Resampling.LANCZOS)
+
+        image.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGB", (1000, 1000), "white")
+        canvas.paste(image, ((1000 - image.width) // 2, (1000 - image.height) // 2))
+
+        quality = 92
+        encoded = None
+        while quality >= 60:
+            buffer = io.BytesIO()
+            canvas.save(buffer, format="WEBP", quality=quality, method=6)
+            encoded = buffer.getvalue()
+            if len(encoded) / 1024 <= 49.0:
+                break
+            quality -= 4
+
+        return {
+            "name": output_name + ".webp",
+            "bytes": encoded,
+            "original_resolution": f"{orig_w}x{orig_h}",
+            "final_canvas": "1000x1000",
+            "size_kb": round(len(encoded) / 1024, 2),
+            "quality": quality,
+            "under_50_kb": len(encoded) / 1024 <= 50.0,
+            "upscaled": was_upscaled,
+        }
+
+
+def _process_excel_server_side(uploaded_file):
+    raw = uploaded_file.getvalue()
+    workbook = __import__("openpyxl").load_workbook(io.BytesIO(raw), read_only=True, data_only=True) if uploaded_file.name.lower().endswith((".xlsx", ".xlsm")) else None
+    if workbook:
+        sheet = workbook.active
+        iterator = sheet.iter_rows(values_only=True)
+        header_row = next(iterator, None)
+        if not header_row:
+            raise ValueError("The spreadsheet is empty.")
+        headers = [str(value or "").strip().lower() for value in header_row]
+        rows = [dict(zip(headers, row)) for row in iterator]
+    elif uploaded_file.name.lower().endswith(".csv"):
+        text = raw.decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(text))
+        if not reader.fieldnames:
+            raise ValueError("The CSV file is empty.")
+        rows = [{str(k or "").strip().lower(): v for k, v in row.items()} for row in reader]
+    else:
+        raise ValueError("Please upload an .xlsx or .csv file. Save legacy .xls files as .xlsx first.")
+
+    url_key = next((key for key in (rows[0].keys() if rows else []) if key == "image link"), None)
+    name_key = next((key for key in (rows[0].keys() if rows else []) if key == "image name"), None)
+    if not url_key or not name_key:
+        raise ValueError('Required columns "Image link" and "Image name" were not found in the first worksheet.')
+
+    output_rows = []
+    failures = []
+    used_names = set()
+    active_rows = [(idx + 2, row) for idx, row in enumerate(rows) if str(row.get(url_key) or "").strip() or str(row.get(name_key) or "").strip()]
+    progress = st.progress(0)
+    status = st.empty()
+    for index, (sheet_row, row) in enumerate(active_rows):
+        url = str(row.get(url_key) or "").strip()
+        raw_name = str(row.get(name_key) or "").strip()
+        status.write(f"Downloading and optimizing image {index + 1} of {len(active_rows)}...")
+        progress.progress((index + 1) / max(1, len(active_rows)))
+        if not url or not raw_name:
+            failures.append(f"Row {sheet_row}: Image link or Image name is blank.")
+            continue
+        try:
+            data = _download_image(url)
+            base_name = _safe_output_name(raw_name, f"image_{index + 1}")
+            unique_name = base_name
+            suffix = 2
+            while (unique_name + ".webp").lower() in used_names:
+                unique_name = f"{base_name}_{suffix}"
+                suffix += 1
+            used_names.add((unique_name + ".webp").lower())
+            result = _optimize_image_bytes(data, unique_name)
+            result["original_name"] = raw_name
+            output_rows.append(result)
+        except Exception as exc:
+            failures.append(f"Row {sheet_row} ({raw_name or 'unnamed'}): {str(exc)[:250]}")
+
+    status.write(f"Completed: {len(output_rows)} successful, {len(failures)} failed.")
+    progress.empty()
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for item in output_rows:
+            archive.writestr(item["name"], item["bytes"])
+        audit_buffer = io.StringIO()
+        fields = ["Original Name", "Output WebP Name", "Original Resolution", "Final Canvas", "Format", "Final Size (KB)", "Quality Level (%)", "Under 50 KB", "Upscaled (< 600px)"]
+        writer = csv.DictWriter(audit_buffer, fieldnames=fields)
+        writer.writeheader()
+        for item in output_rows:
+            writer.writerow({
+                "Original Name": item["original_name"],
+                "Output WebP Name": item["name"],
+                "Original Resolution": item["original_resolution"],
+                "Final Canvas": item["final_canvas"],
+                "Format": "WEBP",
+                "Final Size (KB)": item["size_kb"],
+                "Quality Level (%)": item["quality"],
+                "Under 50 KB": "Yes" if item["under_50_kb"] else "No",
+                "Upscaled (< 600px)": "Yes" if item["upscaled"] else "No",
+            })
+        archive.writestr("Shopee_Image_Processing_Log.csv", audit_buffer.getvalue())
+    return zip_buffer.getvalue(), output_rows, failures
+
+
+st.markdown("### Excel Image Import — Server-Side Download")
+st.caption("This mode downloads images from the server, so it can handle many URLs that browser-based downloads reject due to CORS. It applies the same 1000×1000 white canvas, small-image upscaling, WebP conversion, and compression target.")
+server_excel = st.file_uploader("Upload Excel/CSV with “Image link” and “Image name” columns", type=["xlsx", "xlsm", "csv"], key="server_excel_upload")
+if server_excel is not None and st.button("Download and Optimize Excel Images", type="primary", key="server_excel_process"):
+    try:
+        with st.spinner("Processing spreadsheet images..."):
+            zip_data, successful_images, failed_rows = _process_excel_server_side(server_excel)
+        st.success(f"Processed {len(successful_images)} image(s); {len(failed_rows)} row(s) failed.")
+        st.download_button("Download Optimized Images + Audit Log (.ZIP)", data=zip_data, file_name="Shopee_Optimized_Images_From_Excel.zip", mime="application/zip")
+        if failed_rows:
+            with st.expander(f"View failed rows ({len(failed_rows)})"):
+                st.text("\n".join(failed_rows))
+        if successful_images:
+            st.dataframe([{"Output Name": item["name"], "Original Resolution": item["original_resolution"], "Size (KB)": item["size_kb"], "Quality": item["quality"], "Upscaled": item["upscaled"]} for item in successful_images], use_container_width=True)
+    except Exception as exc:
+        st.error(f"Could not process this spreadsheet: {exc}")
+
+
 # 2. Inject HTML Canvas Tool into Streamlit
 HTML_CONTENT = """
 <!DOCTYPE html>
