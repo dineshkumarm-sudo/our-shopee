@@ -249,7 +249,7 @@ def _process_excel_server_side(uploaded_file):
         for item in output_rows:
             archive.writestr(item["name"], item["bytes"])
         audit_buffer = io.StringIO()
-        fields = ["Original Name", "Output WebP Name", "Original Resolution", "Final Canvas", "Format", "Final Size (KB)", "Quality Level (%)", "Under 50 KB", "Upscaled / Enhanced", "Content Scale (%)", "White Background Detected", "May Be Stretched", "Processing Comment"]
+        fields = ["Original Name", "Output WebP Name", "Original Resolution", "Final Canvas", "Format", "Final Size (KB)", "Quality Level (%)", "Under 50 KB", "Upscaled (< 600px)", "Content Scale (%)", "White Background Detected", "May Be Stretched", "Processing Comment"]
         writer = csv.DictWriter(audit_buffer, fieldnames=fields)
         writer.writeheader()
         for item in output_rows:
