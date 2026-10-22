@@ -144,6 +144,9 @@ def _optimize_image_bytes(image_bytes, output_name):
             "upscaled": was_upscaled,
             "resized": True,
             "content_scale_percent": round(content_scale * 100),
+            "white_background_detected": has_white_background,
+            "may_be_stretched": may_be_stretched,
+            "background_note": background_note,
             "compressed": True,
         }
 
@@ -239,7 +242,7 @@ def _process_excel_server_side(uploaded_file):
         for item in output_rows:
             archive.writestr(item["name"], item["bytes"])
         audit_buffer = io.StringIO()
-        fields = ["Original Name", "Output WebP Name", "Original Resolution", "Final Canvas", "Format", "Final Size (KB)", "Quality Level (%)", "Under 50 KB", "Upscaled (< 600px)", "Content Scale (%)"]
+        fields = ["Original Name", "Output WebP Name", "Original Resolution", "Final Canvas", "Format", "Final Size (KB)", "Quality Level (%)", "Under 50 KB", "Upscaled (< 600px)", "Content Scale (%)", "White Background Detected", "May Be Stretched", "Processing Comment"]
         writer = csv.DictWriter(audit_buffer, fieldnames=fields)
         writer.writeheader()
         for item in output_rows:
@@ -254,6 +257,9 @@ def _process_excel_server_side(uploaded_file):
                 "Under 50 KB": "Yes" if item["under_50_kb"] else "No",
                 "Upscaled (< 600px)": "Yes" if item["upscaled"] else "No",
                 "Content Scale (%)": item.get("content_scale_percent", 100),
+                "White Background Detected": "Yes" if item.get("white_background_detected") else "No",
+                "May Be Stretched": "Yes" if item.get("may_be_stretched") else "No",
+                "Processing Comment": item.get("background_note", ""),
             })
         archive.writestr("Shopee_Image_Processing_Log.csv", audit_buffer.getvalue())
     return zip_buffer.getvalue(), output_rows, failures
@@ -732,13 +738,42 @@ HTML_CONTENT = """
                     ctx.fillStyle = '#FFFFFF';
                     ctx.fillRect(0, 0, 1000, 1000);
 
-                    const scale = Math.min(1000 / srcW, 1000 / srcH);
-                    const fitW = srcW * scale;
-                    const fitH = srcH * scale;
-                    const pasteX = (1000 - fitW) / 2;
-                    const pasteY = (1000 - fitH) / 2;
-
-                    ctx.drawImage(canvasSource, pasteX, pasteY, fitW, fitH);
+                    const sampleCanvas = document.createElement('canvas');
+                    sampleCanvas.width = 100;
+                    sampleCanvas.height = 100;
+                    const sampleCtx = sampleCanvas.getContext('2d');
+                    sampleCtx.drawImage(canvasSource, 0, 0, 100, 100);
+                    const sampleData = sampleCtx.getImageData(0, 0, 100, 100).data;
+                    let edgePixels = 0;
+                    let whiteEdgePixels = 0;
+                    for (let x = 0; x < 100; x++) {
+                        for (const y of [0, 99]) {
+                            const p = (y * 100 + x) * 4;
+                            edgePixels++;
+                            if (sampleData[p] >= 245 && sampleData[p + 1] >= 245 && sampleData[p + 2] >= 245) whiteEdgePixels++;
+                        }
+                    }
+                    for (let y = 1; y < 99; y++) {
+                        for (const x of [0, 99]) {
+                            const p = (y * 100 + x) * 4;
+                            edgePixels++;
+                            if (sampleData[p] >= 245 && sampleData[p + 1] >= 245 && sampleData[p + 2] >= 245) whiteEdgePixels++;
+                        }
+                    }
+                    const hasWhiteBackground = whiteEdgePixels / Math.max(1, edgePixels) >= 0.90;
+                    let mayBeStretched = false;
+                    let backgroundNote = '';
+                    if (hasWhiteBackground) {
+                        const scale = Math.min(1000 / srcW, 1000 / srcH);
+                        const fitW = srcW * scale;
+                        const fitH = srcH * scale;
+                        ctx.drawImage(canvasSource, (1000 - fitW) / 2, (1000 - fitH) / 2, fitW, fitH);
+                        backgroundNote = 'White background detected; aspect ratio preserved.';
+                    } else {
+                        ctx.drawImage(canvasSource, 0, 0, 1000, 1000);
+                        mayBeStretched = true;
+                        backgroundNote = 'WARNING: Non-white background detected; image may be stretched to 1000x1000.';
+                    }
 
                     let quality = 0.92;
                     let blob = null;
