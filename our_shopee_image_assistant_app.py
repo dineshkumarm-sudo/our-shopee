@@ -84,6 +84,17 @@ HTML_CONTENT = """
             </div>
         </div>
 
+        <!-- Excel URL Import -->
+        <div class="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
+            <h2 class="text-lg font-bold text-slate-800">Import Images from Excel</h2>
+            <p class="text-sm text-slate-600 mt-1 mb-4">Upload an .xlsx, .xls, or .csv file with columns named <strong>Image link</strong> and <strong>Image name</strong>. Images will be downloaded, optimized using the same settings, and saved using the names in the second column.</p>
+            <div class="flex flex-col sm:flex-row gap-3 items-start sm:items-center">
+                <input type="file" id="excelInput" accept=".xlsx,.xls,.csv" class="block w-full text-sm text-slate-600 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:font-semibold file:bg-emerald-50 file:text-emerald-700 hover:file:bg-emerald-100">
+                <button id="processExcelBtn" disabled class="shrink-0 bg-emerald-600 disabled:bg-slate-300 hover:bg-emerald-700 text-white font-bold py-2 px-5 rounded-lg">Process Excel Images</button>
+            </div>
+            <p id="excelHelp" class="text-xs text-slate-500 mt-2">Use direct image URLs that are publicly accessible. Some websites block browser-based downloads; those rows will be reported as failed.</p>
+        </div>
+
         <!-- Progress Indicator -->
         <div id="progressContainer" class="hidden bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
             <div class="flex justify-between items-center mb-2">
@@ -177,6 +188,20 @@ HTML_CONTENT = """
         const statUpscaled = document.getElementById('statUpscaled');
 
         let processedFiles = [];
+        let selectedExcelFile = null;
+        const excelInput = document.getElementById('excelInput');
+        const processExcelBtn = document.getElementById('processExcelBtn');
+        const excelHelp = document.getElementById('excelHelp');
+
+        excelInput.addEventListener('change', (e) => {
+            selectedExcelFile = e.target.files && e.target.files[0] ? e.target.files[0] : null;
+            processExcelBtn.disabled = !selectedExcelFile;
+            if (selectedExcelFile) excelHelp.textContent = "Selected: " + selectedExcelFile.name;
+        });
+
+        processExcelBtn.addEventListener('click', async () => {
+            if (selectedExcelFile) await processExcelImages(selectedExcelFile);
+        });
 
         dropzone.addEventListener('click', () => fileInput.click());
 
@@ -251,7 +276,110 @@ HTML_CONTENT = """
             tableContainer.classList.remove('hidden');
         }
 
-        function processImage(file) {
+        function safeOutputBaseName(value, fallback) {
+            let name = String(value ?? '').trim();
+            name = name.replace(/\\.[^.\\/]+$/, '');
+            name = name.replace(/[\\\\/:*?"<>|\\x00-\\x1F]/g, '_').replace(/[. ]+$/g, '').trim();
+            return name || fallback || 'image';
+        }
+
+        async function processExcelImages(excelFile) {
+            let rows;
+            try {
+                const buffer = await excelFile.arrayBuffer();
+                const workbook = excelFile.name.toLowerCase().endsWith('.csv')
+                    ? XLSX.read(await excelFile.text(), { type: 'string' })
+                    : XLSX.read(buffer, { type: 'array' });
+                const sheet = workbook.Sheets[workbook.SheetNames[0]];
+                rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+            } catch (err) {
+                alert('Could not read the Excel/CSV file. Please check that it is a valid file.');
+                return;
+            }
+
+            if (!rows.length) {
+                alert('The selected spreadsheet has no data rows.');
+                return;
+            }
+
+            const normalizeHeader = value => String(value).trim().toLowerCase().replace(/\\s+/g, ' ');
+            const headers = Object.keys(rows[0]);
+            const urlHeader = headers.find(h => normalizeHeader(h) === 'image link');
+            const nameHeader = headers.find(h => normalizeHeader(h) === 'image name');
+            if (!urlHeader || !nameHeader) {
+                alert('Required columns not found. The first worksheet must contain headers named "Image link" and "Image name".');
+                return;
+            }
+
+            processedFiles = [];
+            tableBody.innerHTML = '';
+            dashboard.classList.add('hidden');
+            actionsContainer.classList.add('hidden');
+            tableContainer.classList.add('hidden');
+            progressContainer.classList.remove('hidden');
+            processExcelBtn.disabled = true;
+            excelInput.disabled = true;
+            const failures = [];
+            const usedNames = new Set();
+            const validRows = rows.filter(row => String(row[urlHeader] || '').trim() || String(row[nameHeader] || '').trim());
+
+            for (let i = 0; i < validRows.length; i++) {
+                const row = validRows[i];
+                const rawUrl = String(row[urlHeader] || '').trim();
+                const rawName = String(row[nameHeader] || '').trim();
+                const pct = Math.round(((i + 1) / validRows.length) * 100);
+                progressText.innerText = "Downloading and processing " + (i + 1) + " of " + validRows.length;
+                progressPercent.innerText = pct + "%";
+                progressBar.style.width = pct + "%";
+
+                if (!rawUrl || !rawName) {
+                    failures.push("Row " + (i + 2) + ": Image link or Image name is blank.");
+                    continue;
+                }
+
+                try {
+                    const parsedUrl = new URL(rawUrl);
+                    if (!['http:', 'https:'].includes(parsedUrl.protocol)) throw new Error('Only HTTP/HTTPS image links are supported.');
+                    const response = await fetch(parsedUrl.href);
+                    if (!response.ok) throw new Error("Download failed (HTTP " + response.status + ").");
+                    const blob = await response.blob();
+                    if (!blob.size) throw new Error('Downloaded file is empty.');
+                    if (blob.type && !blob.type.startsWith('image/')) throw new Error("URL did not return an image (" + blob.type + ").");
+
+                    const baseName = safeOutputBaseName(rawName, "image_" + (i + 1));
+                    let uniqueName = baseName;
+                    let suffix = 2;
+                    while (usedNames.has((uniqueName + '.webp').toLowerCase())) uniqueName = baseName + '_' + suffix++;
+                    usedNames.add((uniqueName + '.webp').toLowerCase());
+                    const ext = (blob.type.split('/')[1] || 'jpeg').replace('jpeg', 'jpg').replace('svg+xml', 'svg');
+                    const imageFile = new File([blob], uniqueName + '.' + ext, { type: blob.type || 'image/jpeg' });
+                    const result = await processImage(imageFile, uniqueName);
+                    result.origName = rawName;
+                    processedFiles.push(result);
+                    renderTableRow(result);
+                } catch (err) {
+                    failures.push("Row " + (i + 2) + " (" + (rawName || 'unnamed') + "): " + (err.message || 'Could not download/process image. The host may block browser access (CORS).'));
+                }
+            }
+
+            progressText.innerText = "Processing complete: " + processedFiles.length + " successful, " + failures.length + " failed.";
+            updateDashboard();
+            dashboard.classList.remove('hidden');
+            actionsContainer.classList.remove('hidden');
+            tableContainer.classList.remove('hidden');
+            processExcelBtn.disabled = false;
+            excelInput.disabled = false;
+            if (failures.length) {
+                const preview = failures.slice(0, 10).join('\n');
+                alert("Finished with " + failures.length + " failed row(s).\n\n" + preview + (failures.length > 10 ? "\n...and " + (failures.length - 10) + " more. Check the browser console for details." : ''));
+                console.warn('Excel image import failures:', failures);
+                excelHelp.textContent = processedFiles.length + " image(s) processed; " + failures.length + " row(s) failed. See the alert and browser console for failed rows.";
+            } else {
+                excelHelp.textContent = "Successfully processed all " + processedFiles.length + " image(s) from " + excelFile.name + ".";
+            }
+        }
+
+        function processImage(file, requestedBaseName = null) {
             return new Promise((resolve) => {
                 const img = new Image();
                 const url = URL.createObjectURL(file);
@@ -306,7 +434,7 @@ HTML_CONTENT = """
                         quality -= 0.04;
                     }
 
-                    const baseName = file.name.substring(0, file.name.lastIndexOf('.')) || file.name;
+                    const baseName = requestedBaseName || file.name.substring(0, file.name.lastIndexOf('.')) || file.name;
                     const outputName = `${baseName}.webp`;
                     const previewUrl = URL.createObjectURL(blob);
 
