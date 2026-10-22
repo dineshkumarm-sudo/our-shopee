@@ -89,7 +89,7 @@ def _optimize_image_bytes(image_bytes, output_name):
         orig_w, orig_h = image.size
         # Enlarge low-resolution images to at least 1000 px on their longest side.
         # LANCZOS interpolation and mild sharpening improve perceived crispness but cannot recreate missing detail.
-        was_upscaled = max(orig_w, orig_h) < 1000 or min(orig_w, orig_h) < 600
+        was_upscaled = max(orig_w, orig_h) < 1000
         if was_upscaled:
             scale = 1000 / max(orig_w, orig_h)
             if scale > 1:
@@ -719,7 +719,7 @@ HTML_CONTENT = """
                 img.onload = async () => {
                     const origW = img.width;
                     const origH = img.height;
-                    const wasUpscaled = origW < 600 || origH < 600;
+                    const wasUpscaled = Math.max(origW, origH) < 1000;
 
                     let srcW = origW;
                     let srcH = origH;
