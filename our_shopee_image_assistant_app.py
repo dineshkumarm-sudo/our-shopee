@@ -96,15 +96,30 @@ def _optimize_image_bytes(image_bytes, output_name):
         canvas = Image.new("RGB", (1000, 1000), "white")
         canvas.paste(image, ((1000 - image.width) // 2, (1000 - image.height) // 2))
 
-        quality = 92
+        # Enforce a strict maximum of 49 KiB, including difficult images.
+        # If low quality is not enough, shrink the image content inside the fixed white canvas.
+        content_scale = 1.0
         encoded = None
-        while quality >= 60:
-            buffer = io.BytesIO()
-            canvas.save(buffer, format="WEBP", quality=quality, method=6)
-            encoded = buffer.getvalue()
-            if len(encoded) / 1024 <= 49.0:
+        quality = 92
+        while True:
+            content_w = max(1, round(image.width * content_scale))
+            content_h = max(1, round(image.height * content_scale))
+            content = image if content_scale == 1.0 else image.resize((content_w, content_h), Image.Resampling.LANCZOS)
+            work_canvas = Image.new("RGB", (1000, 1000), "white")
+            work_canvas.paste(content, ((1000 - content.width) // 2, (1000 - content.height) // 2))
+            quality = 92
+            while quality >= 10:
+                buffer = io.BytesIO()
+                work_canvas.save(buffer, format="WEBP", quality=quality, method=6)
+                encoded = buffer.getvalue()
+                if len(encoded) <= 49 * 1024:
+                    break
+                quality -= 5
+            if len(encoded) <= 49 * 1024:
                 break
-            quality -= 4
+            if content_scale <= 0.35:
+                raise ValueError("Could not compress this image below 49 KB.")
+            content_scale = round(content_scale - 0.1, 2)
 
         return {
             "name": output_name + ".webp",
@@ -113,8 +128,11 @@ def _optimize_image_bytes(image_bytes, output_name):
             "final_canvas": "1000x1000",
             "size_kb": round(len(encoded) / 1024, 2),
             "quality": quality,
-            "under_50_kb": len(encoded) / 1024 <= 50.0,
+            "under_50_kb": len(encoded) <= 49 * 1024,
             "upscaled": was_upscaled,
+            "resized": True,
+            "content_scale_percent": round(content_scale * 100),
+            "compressed": True,
         }
 
 
@@ -149,16 +167,39 @@ def _process_excel_server_side(uploaded_file):
     active_rows = [(idx + 2, row) for idx, row in enumerate(rows) if str(row.get(url_key) or "").strip() or str(row.get(name_key) or "").strip()]
     progress = st.progress(0)
     status = st.empty()
+    live_tiles = st.empty()
+    counts = {"downloaded": 0, "resized": 0, "compressed": 0, "errors": 0}
+
+    def _render_live_tiles(current, total):
+        live_tiles.markdown(
+            f"""
+            <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:10px 0 16px;">
+              <div style="border:1px solid #d1d5db;border-radius:12px;padding:12px;text-align:center;"><div style="font-size:12px;color:#64748b;">Downloaded</div><div style="font-size:25px;font-weight:700;">{counts['downloaded']}</div></div>
+              <div style="border:1px solid #d1d5db;border-radius:12px;padding:12px;text-align:center;"><div style="font-size:12px;color:#64748b;">Resized</div><div style="font-size:25px;font-weight:700;">{counts['resized']}</div></div>
+              <div style="border:1px solid #d1d5db;border-radius:12px;padding:12px;text-align:center;"><div style="font-size:12px;color:#64748b;">Compressed ≤ 49 KB</div><div style="font-size:25px;font-weight:700;color:#059669;">{counts['compressed']}</div></div>
+              <div style="border:1px solid #d1d5db;border-radius:12px;padding:12px;text-align:center;"><div style="font-size:12px;color:#64748b;">Errors</div><div style="font-size:25px;font-weight:700;color:#dc2626;">{counts['errors']}</div></div>
+            </div>
+            <div style="font-size:12px;color:#64748b;">Progress: {current} / {total} rows checked</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    _render_live_tiles(0, len(active_rows))
     for index, (sheet_row, row) in enumerate(active_rows):
         url = str(row.get(url_key) or "").strip()
         raw_name = str(row.get(name_key) or "").strip()
         status.write(f"Downloading and optimizing image {index + 1} of {len(active_rows)}...")
-        progress.progress((index + 1) / max(1, len(active_rows)))
+        progress.progress(index / max(1, len(active_rows)))
         if not url or not raw_name:
             failures.append(f"Row {sheet_row}: Image link or Image name is blank.")
+            counts["errors"] += 1
+            _render_live_tiles(index + 1, len(active_rows))
+            progress.progress((index + 1) / max(1, len(active_rows)))
             continue
         try:
             data = _download_image(url)
+            counts["downloaded"] += 1
+            _render_live_tiles(index + 1, len(active_rows))
             base_name = _safe_output_name(raw_name, f"image_{index + 1}")
             unique_name = base_name
             suffix = 2
@@ -169,8 +210,15 @@ def _process_excel_server_side(uploaded_file):
             result = _optimize_image_bytes(data, unique_name)
             result["original_name"] = raw_name
             output_rows.append(result)
+            counts["resized"] += 1
+            if len(result["bytes"]) <= 49 * 1024:
+                counts["compressed"] += 1
+            _render_live_tiles(index + 1, len(active_rows))
         except Exception as exc:
             failures.append(f"Row {sheet_row} ({raw_name or 'unnamed'}): {str(exc)[:250]}")
+            counts["errors"] += 1
+            _render_live_tiles(index + 1, len(active_rows))
+        progress.progress((index + 1) / max(1, len(active_rows)))
 
     status.write(f"Completed: {len(output_rows)} successful, {len(failures)} failed.")
     progress.empty()
@@ -179,7 +227,7 @@ def _process_excel_server_side(uploaded_file):
         for item in output_rows:
             archive.writestr(item["name"], item["bytes"])
         audit_buffer = io.StringIO()
-        fields = ["Original Name", "Output WebP Name", "Original Resolution", "Final Canvas", "Format", "Final Size (KB)", "Quality Level (%)", "Under 50 KB", "Upscaled (< 600px)"]
+        fields = ["Original Name", "Output WebP Name", "Original Resolution", "Final Canvas", "Format", "Final Size (KB)", "Quality Level (%)", "Under 50 KB", "Upscaled (< 600px)", "Content Scale (%)"]
         writer = csv.DictWriter(audit_buffer, fieldnames=fields)
         writer.writeheader()
         for item in output_rows:
@@ -193,6 +241,7 @@ def _process_excel_server_side(uploaded_file):
                 "Quality Level (%)": item["quality"],
                 "Under 50 KB": "Yes" if item["under_50_kb"] else "No",
                 "Upscaled (< 600px)": "Yes" if item["upscaled"] else "No",
+                "Content Scale (%)": item.get("content_scale_percent", 100),
             })
         archive.writestr("Shopee_Image_Processing_Log.csv", audit_buffer.getvalue())
     return zip_buffer.getvalue(), output_rows, failures
@@ -313,6 +362,14 @@ HTML_CONTENT = """
             </div>
         </div>
 
+        <!-- Live Processing Tiles -->
+        <div id="liveStats" class="hidden grid grid-cols-2 md:grid-cols-4 gap-3">
+            <div class="bg-white border border-slate-200 rounded-xl p-4 text-center shadow-sm"><div class="text-xs font-bold uppercase text-slate-500 tracking-wider">Downloaded</div><div id="liveDownloaded" class="text-2xl font-extrabold text-sky-600 mt-1">0</div></div>
+            <div class="bg-white border border-slate-200 rounded-xl p-4 text-center shadow-sm"><div class="text-xs font-bold uppercase text-slate-500 tracking-wider">Resized</div><div id="liveResized" class="text-2xl font-extrabold text-emerald-600 mt-1">0</div></div>
+            <div class="bg-white border border-slate-200 rounded-xl p-4 text-center shadow-sm"><div class="text-xs font-bold uppercase text-slate-500 tracking-wider">Compressed ≤ 49 KB</div><div id="liveCompressed" class="text-2xl font-extrabold text-emerald-600 mt-1">0</div></div>
+            <div class="bg-white border border-slate-200 rounded-xl p-4 text-center shadow-sm"><div class="text-xs font-bold uppercase text-slate-500 tracking-wider">Errors</div><div id="liveErrors" class="text-2xl font-extrabold text-rose-600 mt-1">0</div></div>
+        </div>
+
         <!-- Metrics Dashboard -->
         <div id="dashboard" class="hidden grid grid-cols-2 md:grid-cols-5 gap-3">
             <div class="bg-white border border-slate-200 rounded-xl p-4 text-center shadow-sm">
@@ -387,6 +444,25 @@ HTML_CONTENT = """
         const actionsContainer = document.getElementById('actionsContainer');
         const tableContainer = document.getElementById('tableContainer');
         const tableBody = document.getElementById('tableBody');
+        const liveStats = document.getElementById('liveStats');
+        const liveDownloaded = document.getElementById('liveDownloaded');
+        const liveResized = document.getElementById('liveResized');
+        const liveCompressed = document.getElementById('liveCompressed');
+        const liveErrors = document.getElementById('liveErrors');
+        let liveCounts = { downloaded: 0, resized: 0, compressed: 0, errors: 0 };
+
+        function resetLiveStats() {
+            liveCounts = { downloaded: 0, resized: 0, compressed: 0, errors: 0 };
+            updateLiveStats();
+            liveStats.classList.remove('hidden');
+        }
+
+        function updateLiveStats() {
+            liveDownloaded.innerText = liveCounts.downloaded;
+            liveResized.innerText = liveCounts.resized;
+            liveCompressed.innerText = liveCounts.compressed;
+            liveErrors.innerText = liveCounts.errors;
+        }
 
         const statTotal = document.getElementById('statTotal');
         const statCanvas = document.getElementById('statCanvas');
@@ -461,6 +537,10 @@ HTML_CONTENT = """
 
             processedFiles = [];
             tableBody.innerHTML = '';
+            resetLiveStats();
+            dashboard.classList.add('hidden');
+            actionsContainer.classList.add('hidden');
+            tableContainer.classList.add('hidden');
             progressContainer.classList.remove('hidden');
 
             for (let i = 0; i < fileList.length; i++) {
@@ -470,9 +550,17 @@ HTML_CONTENT = """
                 progressPercent.innerText = `${pct}%`;
                 progressBar.style.width = `${pct}%`;
 
-                const result = await processImage(file);
-                processedFiles.push(result);
-                renderTableRow(result);
+                try {
+                    const result = await processImage(file);
+                    liveCounts.downloaded += 1;
+                    liveCounts.resized += 1;
+                    if (Number(result.sizeKB) <= 49) liveCounts.compressed += 1;
+                    processedFiles.push(result);
+                    renderTableRow(result);
+                } catch (err) {
+                    liveCounts.errors += 1;
+                }
+                updateLiveStats();
             }
 
             progressText.innerText = '✅ Batch processing complete!';
@@ -523,6 +611,7 @@ HTML_CONTENT = """
             dashboard.classList.add('hidden');
             actionsContainer.classList.add('hidden');
             tableContainer.classList.add('hidden');
+            resetLiveStats();
             progressContainer.classList.remove('hidden');
             processExcelBtn.disabled = true;
             excelInput.disabled = true;
@@ -540,6 +629,8 @@ HTML_CONTENT = """
                 progressBar.style.width = pct + "%";
 
                 if (!rawUrl || !rawName) {
+                    liveCounts.errors += 1;
+                    updateLiveStats();
                     failures.push("Row " + (i + 2) + ": Image link or Image name is blank.");
                     continue;
                 }
@@ -551,6 +642,8 @@ HTML_CONTENT = """
                     if (!response.ok) throw new Error("Download failed (HTTP " + response.status + ").");
                     const blob = await response.blob();
                     if (!blob.size) throw new Error('Downloaded file is empty.');
+                    liveCounts.downloaded += 1;
+                    updateLiveStats();
                     if (blob.type && !blob.type.startsWith('image/')) throw new Error("URL did not return an image (" + blob.type + ").");
 
                     const baseName = safeOutputBaseName(rawName, "image_" + (i + 1));
@@ -563,8 +656,13 @@ HTML_CONTENT = """
                     const result = await processImage(imageFile, uniqueName);
                     result.origName = rawName;
                     processedFiles.push(result);
+                    liveCounts.resized += 1;
+                    if (Number(result.sizeKB) <= 49) liveCounts.compressed += 1;
+                    updateLiveStats();
                     renderTableRow(result);
                 } catch (err) {
+                    liveCounts.errors += 1;
+                    updateLiveStats();
                     failures.push("Row " + (i + 2) + " (" + (rawName || 'unnamed') + "): " + (err.message || 'Could not download/process image. The host may block browser access (CORS).'));
                 }
             }
@@ -633,12 +731,34 @@ HTML_CONTENT = """
                     let quality = 0.92;
                     let blob = null;
                     let sizeKB = 0;
+                    let contentScale = 1.0;
+                    const sourceCanvas = document.createElement('canvas');
+                    sourceCanvas.width = 1000;
+                    sourceCanvas.height = 1000;
+                    sourceCanvas.getContext('2d').drawImage(canvas, 0, 0);
 
-                    while (quality >= 0.60) {
-                        blob = await new Promise(res => canvas.toBlob(res, 'image/webp', quality));
-                        sizeKB = blob.size / 1024;
-                        if (sizeKB <= 49.0) break;
-                        quality -= 0.04;
+                    while (true) {
+                        const workingCanvas = document.createElement('canvas');
+                        workingCanvas.width = 1000;
+                        workingCanvas.height = 1000;
+                        const wctx = workingCanvas.getContext('2d');
+                        wctx.fillStyle = '#FFFFFF';
+                        wctx.fillRect(0, 0, 1000, 1000);
+                        const contentW = Math.max(1, Math.round(1000 * contentScale));
+                        const contentH = Math.max(1, Math.round(1000 * contentScale));
+                        wctx.drawImage(sourceCanvas, 0, 0, 1000, 1000, (1000-contentW)/2, (1000-contentH)/2, contentW, contentH);
+
+                        quality = 0.92;
+                        while (quality >= 0.10) {
+                            blob = await new Promise(res => workingCanvas.toBlob(res, 'image/webp', quality));
+                            if (!blob) throw new Error('WebP encoding failed.');
+                            sizeKB = blob.size / 1024;
+                            if (blob.size <= 49 * 1024) break;
+                            quality -= 0.05;
+                        }
+                        if (blob && blob.size <= 49 * 1024) break;
+                        if (contentScale <= 0.35) throw new Error('Could not compress this image below 49 KB.');
+                        contentScale = Math.round((contentScale - 0.1) * 100) / 100;
                     }
 
                     const baseName = requestedBaseName || file.name.substring(0, file.name.lastIndexOf('.')) || file.name;
@@ -654,8 +774,9 @@ HTML_CONTENT = """
                         finalCanvas: '1000x1000',
                         sizeKB: sizeKB.toFixed(2),
                         quality: Math.round(quality * 100),
-                        under50: sizeKB <= 50.0,
+                        under50: blob.size <= 49 * 1024,
                         upscaled: wasUpscaled,
+                        contentScale: Math.round(contentScale * 100),
                         blob: blob,
                         previewUrl: previewUrl
                     });
