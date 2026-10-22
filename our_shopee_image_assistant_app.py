@@ -108,6 +108,9 @@ def _optimize_image_bytes(image_bytes, output_name):
             may_be_stretched = True
             background_note = "WARNING: Non-white background detected; image may be stretched to 1000x1000."
 
+        # Compress the already-composed square canvas so background handling is retained.
+        image = canvas
+
         # Enforce a strict maximum of 49 KiB, including difficult images.
         # If low quality is not enough, shrink the image content inside the fixed white canvas.
         content_scale = 1.0
