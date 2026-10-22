@@ -278,8 +278,8 @@ HTML_CONTENT = """
 
         function safeOutputBaseName(value, fallback) {
             let name = String(value ?? '').trim();
-            name = name.replace(/\\.[^.\\/]+$/, '');
-            name = name.replace(/[\\\\/:*?"<>|\\x00-\\x1F]/g, '_').replace(/[. ]+$/g, '').trim();
+            name = name.replace(/\.[^./\\]+$/, '');
+            name = name.replace(/[\\/:*?"<>|\x00-\x1F]/g, '_').replace(/[. ]+$/g, '').trim();
             return name || fallback || 'image';
         }
 
@@ -302,7 +302,7 @@ HTML_CONTENT = """
                 return;
             }
 
-            const normalizeHeader = value => String(value).trim().toLowerCase().replace(/\\s+/g, ' ');
+            const normalizeHeader = value => String(value).trim().toLowerCase().replace(/\s+/g, ' ');
             const headers = Object.keys(rows[0]);
             const urlHeader = headers.find(h => normalizeHeader(h) === 'image link');
             const nameHeader = headers.find(h => normalizeHeader(h) === 'image name');
