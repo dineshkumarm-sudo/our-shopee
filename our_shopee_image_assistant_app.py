@@ -92,9 +92,21 @@ def _optimize_image_bytes(image_bytes, output_name):
             scale = max(600 / orig_w, 600 / orig_h)
             image = image.resize((round(orig_w * scale), round(orig_h * scale)), Image.Resampling.LANCZOS)
 
-        image.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
+        sample = image.copy()
+        sample.thumbnail((100, 100), Image.Resampling.LANCZOS)
+        px = sample.load()
+        edges = [px[x, 0] for x in range(sample.width)] + [px[x, sample.height - 1] for x in range(sample.width)] + [px[0, y] for y in range(sample.height)] + [px[sample.width - 1, y] for y in range(sample.height)]
+        has_white_background = sum(1 for r, g, b in edges if r >= 245 and g >= 245 and b >= 245) / max(1, len(edges)) >= 0.90
         canvas = Image.new("RGB", (1000, 1000), "white")
-        canvas.paste(image, ((1000 - image.width) // 2, (1000 - image.height) // 2))
+        if has_white_background:
+            image.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
+            canvas.paste(image, ((1000 - image.width) // 2, (1000 - image.height) // 2))
+            may_be_stretched = False
+            background_note = "White background detected; aspect ratio preserved."
+        else:
+            canvas.paste(image.resize((1000, 1000), Image.Resampling.LANCZOS), (0, 0))
+            may_be_stretched = True
+            background_note = "WARNING: Non-white background detected; image may be stretched to 1000x1000."
 
         # Enforce a strict maximum of 49 KiB, including difficult images.
         # If low quality is not enough, shrink the image content inside the fixed white canvas.
