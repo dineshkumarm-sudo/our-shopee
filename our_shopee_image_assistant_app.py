@@ -21,6 +21,8 @@ import subprocess
 import tempfile
 import time
 import secrets
+import hashlib
+import hmac
 from urllib.parse import urlparse, urljoin, urlencode
 
 import requests
@@ -48,10 +50,25 @@ def _drive_oauth_settings():
     return client_id, client_secret, redirect_uri
 
 
+def _make_drive_oauth_state(client_secret):
+    # A signed state works across the OAuth popup's separate Streamlit session.
+    nonce = secrets.token_urlsafe(24)
+    signature = hmac.new(client_secret.encode("utf-8"), nonce.encode("utf-8"), hashlib.sha256).hexdigest()
+    return nonce + "." + signature
+
+
+def _valid_drive_oauth_state(state, client_secret):
+    try:
+        nonce, supplied_signature = str(state).rsplit(".", 1)
+        expected_signature = hmac.new(client_secret.encode("utf-8"), nonce.encode("utf-8"), hashlib.sha256).hexdigest()
+        return bool(nonce) and hmac.compare_digest(expected_signature, supplied_signature)
+    except (ValueError, TypeError):
+        return False
+
+
 def _drive_authorization_url():
-    client_id, _, redirect_uri = _drive_oauth_settings()
-    state = secrets.token_urlsafe(32)
-    st.session_state["drive_oauth_state"] = state
+    client_id, client_secret, redirect_uri = _drive_oauth_settings()
+    state = _make_drive_oauth_state(client_secret)
     params = {"client_id": client_id, "redirect_uri": redirect_uri, "response_type": "code",
               "scope": DRIVE_SCOPE, "access_type": "offline", "prompt": "consent",
               "include_granted_scopes": "true", "state": state}
@@ -66,12 +83,11 @@ def _handle_drive_oauth_callback():
             st.session_state["drive_oauth_notice"] = "Google authorization was not completed: " + str(oauth_error)
             query.clear()
         elif code:
-            expected_state = st.session_state.get("drive_oauth_state")
-            if not expected_state or not returned_state or not secrets.compare_digest(str(expected_state), str(returned_state)):
+            client_id, client_secret, redirect_uri = _drive_oauth_settings()
+            if not returned_state or not _valid_drive_oauth_state(returned_state, client_secret):
                 st.session_state["drive_oauth_notice"] = "Google authorization could not be verified. Please click Connect to Google Drive and try again."
                 query.clear()
             else:
-                client_id, client_secret, redirect_uri = _drive_oauth_settings()
                 response = requests.post("https://oauth2.googleapis.com/token", data={
                     "code": str(code), "client_id": client_id, "client_secret": client_secret,
                     "redirect_uri": redirect_uri, "grant_type": "authorization_code"}, timeout=30)
@@ -83,7 +99,6 @@ def _handle_drive_oauth_callback():
                     "access_token": token_data.get("access_token"),
                     "refresh_token": token_data.get("refresh_token") or old_token.get("refresh_token"),
                     "expires_at": time.time() + int(token_data.get("expires_in", 3600)) - 60}
-                st.session_state.pop("drive_oauth_state", None)
                 st.session_state["drive_oauth_notice"] = "Google Drive connected for this browser session."
                 query.clear()
     except Exception as exc:
