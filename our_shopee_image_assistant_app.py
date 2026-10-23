@@ -363,7 +363,8 @@ def _process_excel_server_side(uploaded_file):
                 counts["compressed"] += 1
             _render_live_tiles(index + 1, len(active_rows))
         except Exception as exc:
-            failures.append(f"Row {sheet_row} ({raw_name or 'unnamed'}): {str(exc)[:250]}")
+            # Preserve full diagnostics so extractor errors are not cut off before display.
+            failures.append(f"Row {sheet_row} ({raw_name or 'unnamed'}): {str(exc)[:2200]}")
             counts["errors"] += 1
             _render_live_tiles(index + 1, len(active_rows))
         progress.progress((index + 1) / max(1, len(active_rows)))
