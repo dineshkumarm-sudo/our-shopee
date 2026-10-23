@@ -15,6 +15,10 @@ import io
 import ipaddress
 import socket
 import zipfile
+import json
+import os
+import subprocess
+import tempfile
 from urllib.parse import urlparse, urljoin
 
 import requests
@@ -272,22 +276,221 @@ def _process_excel_server_side(uploaded_file):
     return zip_buffer.getvalue(), output_rows, failures
 
 
-st.markdown("### Excel Image Import — Server-Side Download")
-st.caption("This mode downloads images from the server, so it can handle many URLs that browser-based downloads reject due to CORS. Low-resolution images are enlarged with high-quality resampling and mild sharpening, then processed to a 1000×1000 canvas, WebP, and the compression target. Upscaling cannot restore detail missing from the original.")
-server_excel = st.file_uploader("Upload Excel/CSV with “Image link” and “Image name” columns", type=["xlsx", "xlsm", "csv"], key="server_excel_upload")
-if server_excel is not None and st.button("Download and Optimize Excel Images", type="primary", key="server_excel_process"):
-    try:
-        with st.spinner("Processing spreadsheet images..."):
-            zip_data, successful_images, failed_rows = _process_excel_server_side(server_excel)
-        st.success(f"Processed {len(successful_images)} image(s); {len(failed_rows)} row(s) failed.")
-        st.download_button("Download Optimized Images + Audit Log (.ZIP)", data=zip_data, file_name="Shopee_Optimized_Images_From_Excel.zip", mime="application/zip")
-        if failed_rows:
-            with st.expander(f"View failed rows ({len(failed_rows)})"):
-                st.text("\n".join(failed_rows))
-        if successful_images:
-            st.dataframe([{"Output Name": item["name"], "Original Resolution": item["original_resolution"], "Final Canvas": item["final_canvas"], "Size (KB)": item["size_kb"], "Quality": item["quality"], "Upscaled": item["upscaled"], "White Background": item["white_background_detected"], "May Be Stretched": item["may_be_stretched"], "Comment": item["background_note"]} for item in successful_images], use_container_width=True)
-    except Exception as exc:
-        st.error(f"Could not process this spreadsheet: {exc}")
+
+
+MAX_VIDEO_BYTES = 1024 * 1024 * 1024
+MAX_VIDEO_OUTPUT_BYTES = 15 * 1024 * 1024
+
+
+def _download_video(url):
+    current_url = url
+    headers = {"User-Agent": "OurShopeeVideoAssistant/1.0"}
+    for _ in range(MAX_REDIRECTS + 1):
+        parsed = _validate_public_url(current_url)
+        with requests.get(current_url, headers=headers, timeout=(10, 60), stream=True, allow_redirects=False) as response:
+            if response.is_redirect or response.is_permanent_redirect:
+                location = response.headers.get("Location")
+                if not location:
+                    raise ValueError("Video host returned a redirect without a destination.")
+                current_url = urljoin(current_url, location)
+                continue
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "").split(";")[0].lower()
+            if content_type and not (content_type.startswith("video/") or content_type in ("application/octet-stream", "binary/octet-stream")):
+                raise ValueError("The URL did not return a video (Content-Type: " + content_type + ").")
+            chunks = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=1024 * 256):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_VIDEO_BYTES:
+                    raise ValueError("Source video exceeds the 1 GB download limit.")
+                chunks.append(chunk)
+            data = b"".join(chunks)
+            if not data:
+                raise ValueError("Downloaded video is empty.")
+            return data
+    raise ValueError("Video URL exceeded the redirect limit.")
+
+
+def _process_video_server_side(uploaded_file):
+    raw = uploaded_file.getvalue()
+    if uploaded_file.name.lower().endswith((".xlsx", ".xlsm")):
+        workbook = __import__("openpyxl").load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        sheet = workbook.active
+        iterator = sheet.iter_rows(values_only=True)
+        header_row = next(iterator, None)
+        if not header_row:
+            raise ValueError("The spreadsheet is empty.")
+        headers = [str(value or "").strip().lower() for value in header_row]
+        rows = [dict(zip(headers, row)) for row in iterator]
+    elif uploaded_file.name.lower().endswith(".csv"):
+        reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig")))
+        if not reader.fieldnames:
+            raise ValueError("The CSV file is empty.")
+        rows = [{str(k or "").strip().lower(): v for k, v in row.items()} for row in reader]
+    else:
+        raise ValueError("Please upload an .xlsx or .csv file. Save legacy .xls files as .xlsx first.")
+
+    first_keys = rows[0].keys() if rows else []
+    url_key = next((key for key in first_keys if key == "video link"), None)
+    name_key = next((key for key in first_keys if key == "video name"), None)
+    if not url_key or not name_key:
+        raise ValueError('Required columns "Video link" and "Video name" were not found in the first worksheet.')
+
+    active_rows = [(idx + 2, row) for idx, row in enumerate(rows) if str(row.get(url_key) or "").strip() or str(row.get(name_key) or "").strip()]
+    output_rows = []
+    failures = []
+    used_names = set()
+    progress = st.progress(0)
+    status = st.empty()
+    for index, (sheet_row, row) in enumerate(active_rows):
+        url = str(row.get(url_key) or "").strip()
+        raw_name = str(row.get(name_key) or "").strip()
+        status.write(f"Downloading and compressing video {index + 1} of {len(active_rows)}...")
+        progress.progress(index / max(1, len(active_rows)))
+        if not url or not raw_name:
+            failures.append(f"Row {sheet_row}: Video link or Video name is blank.")
+            progress.progress((index + 1) / max(1, len(active_rows)))
+            continue
+        try:
+            video_data = _download_video(url)
+            base_name = _safe_output_name(raw_name, f"video_{index + 1}")
+            unique_name = base_name
+            suffix = 2
+            while (unique_name + ".mp4").lower() in used_names:
+                unique_name = f"{base_name}_{suffix}"
+                suffix += 1
+            used_names.add((unique_name + ".mp4").lower())
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                input_path = os.path.join(temp_dir, "source_video")
+                output_path = os.path.join(temp_dir, "compressed.mp4")
+                with open(input_path, "wb") as source_file:
+                    source_file.write(video_data)
+
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-show_entries", "stream=codec_type,width,height", "-of", "json", input_path],
+                    capture_output=True, text=True, timeout=60
+                )
+                if probe.returncode != 0:
+                    raise ValueError("Could not read video metadata. The link may not be a supported video file.")
+                metadata = json.loads(probe.stdout or "{}")
+                video_stream = next((s for s in metadata.get("streams", []) if s.get("codec_type") == "video"), None)
+                if not video_stream:
+                    raise ValueError("The downloaded file does not contain a video stream.")
+                duration = float(metadata.get("format", {}).get("duration") or 0)
+                if duration <= 0:
+                    raise ValueError("Could not determine video duration.")
+                width, height = int(video_stream["width"]), int(video_stream["height"])
+                if width % 2 or height % 2:
+                    raise ValueError(f"Video resolution {width}x{height} has an odd dimension; this MP4 encoding profile cannot preserve it safely.")
+
+                audio_exists = any(s.get("codec_type") == "audio" for s in metadata.get("streams", []))
+                audio_bitrate = 96000 if audio_exists else 0
+                target_total_bitrate = int((MAX_VIDEO_OUTPUT_BYTES * 8 / duration) * 0.86)
+                video_bitrate = max(100000, target_total_bitrate - audio_bitrate)
+                last_size = None
+                for attempt in range(8):
+                    command = [
+                        "ffmpeg", "-y", "-v", "error", "-i", input_path,
+                        "-map", "0:v:0", "-map", "0:a:0?",
+                        "-c:v", "libx264", "-preset", "medium",
+                        "-b:v", str(video_bitrate), "-maxrate", str(video_bitrate),
+                        "-bufsize", str(video_bitrate * 2), "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", "96k", "-sn", "-dn",
+                        "-movflags", "+faststart", "-f", "mp4", output_path
+                    ]
+                    encoded = subprocess.run(command, capture_output=True, text=True, timeout=1800)
+                    if encoded.returncode != 0:
+                        message = (encoded.stderr or "FFmpeg encoding failed.").strip().splitlines()[-1]
+                        raise ValueError("Video conversion failed: " + message[:220])
+                    last_size = os.path.getsize(output_path)
+                    if last_size <= MAX_VIDEO_OUTPUT_BYTES:
+                        break
+                    video_bitrate = max(40000, int(video_bitrate * (MAX_VIDEO_OUTPUT_BYTES / last_size) * 0.88))
+                    if video_bitrate <= 40000 and last_size > MAX_VIDEO_OUTPUT_BYTES:
+                        break
+                if not last_size or last_size > MAX_VIDEO_OUTPUT_BYTES:
+                    raise ValueError("Could not compress this video to 15 MB or less without changing its resolution.")
+
+                with open(output_path, "rb") as output_file:
+                    encoded_data = output_file.read()
+
+            output_rows.append({
+                "name": unique_name + ".mp4",
+                "bytes": encoded_data,
+                "original_name": raw_name,
+                "original_resolution": f"{width}x{height}",
+                "duration_seconds": round(duration, 2),
+                "size_mb": round(len(encoded_data) / (1024 * 1024), 2),
+                "format": "MP4",
+            })
+        except Exception as exc:
+            failures.append(f"Row {sheet_row} ({raw_name or 'unnamed'}): {str(exc)[:250]}")
+        progress.progress((index + 1) / max(1, len(active_rows)))
+
+    status.write(f"Completed: {len(output_rows)} successful, {len(failures)} failed.")
+    progress.empty()
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for item in output_rows:
+            archive.writestr(item["name"], item["bytes"])
+        audit_buffer = io.StringIO()
+        fields = ["Original Name", "Output MP4 Name", "Original Resolution", "Duration (seconds)", "Format", "Final Size (MB)", "Under 15 MB"]
+        writer = csv.DictWriter(audit_buffer, fieldnames=fields)
+        writer.writeheader()
+        for item in output_rows:
+            writer.writerow({
+                "Original Name": item["original_name"],
+                "Output MP4 Name": item["name"],
+                "Original Resolution": item["original_resolution"],
+                "Duration (seconds)": item["duration_seconds"],
+                "Format": item["format"],
+                "Final Size (MB)": item["size_mb"],
+                "Under 15 MB": "Yes" if len(item["bytes"]) <= MAX_VIDEO_OUTPUT_BYTES else "No",
+            })
+        archive.writestr("Shopee_Video_Processing_Log.csv", audit_buffer.getvalue())
+    return zip_buffer.getvalue(), output_rows, failures
+
+
+st.markdown("### Excel Import — Image or Video")
+import_mode = st.selectbox("Choose what you want to process", ["Images", "Videos"], key="server_import_mode")
+if import_mode == "Images":
+    st.caption("Image mode: uses “Image link” and “Image name” columns. Images are processed to a 1000×1000 canvas, WebP, and 49 KB or less. Low-resolution images are enlarged, but upscaling cannot restore missing source detail.")
+    server_excel = st.file_uploader("Upload Excel/CSV with “Image link” and “Image name” columns", type=["xlsx", "xlsm", "csv"], key="server_excel_upload")
+    if server_excel is not None and st.button("Download and Optimize Images", type="primary", key="server_excel_process"):
+        try:
+            with st.spinner("Processing spreadsheet images..."):
+                zip_data, successful_images, failed_rows = _process_excel_server_side(server_excel)
+            st.success(f"Processed {len(successful_images)} image(s); {len(failed_rows)} row(s) failed.")
+            st.download_button("Download Optimized Images + Audit Log (.ZIP)", data=zip_data, file_name="Shopee_Optimized_Images_From_Excel.zip", mime="application/zip")
+            if failed_rows:
+                with st.expander(f"View failed rows ({len(failed_rows)})"):
+                    st.text("\n".join(failed_rows))
+            if successful_images:
+                st.dataframe([{"Output Name": item["name"], "Original Resolution": item["original_resolution"], "Final Canvas": item["final_canvas"], "Size (KB)": item["size_kb"], "Quality": item["quality"], "Upscaled": item["upscaled"], "White Background": item["white_background_detected"], "May Be Stretched": item["may_be_stretched"], "Comment": item["background_note"]} for item in successful_images], use_container_width=True)
+        except Exception as exc:
+            st.error(f"Could not process this spreadsheet: {exc}")
+else:
+    st.caption("Video mode: uses “Video link” and “Video name” columns. Output is MP4, kept at the original resolution, and compressed to 15 MB or less. Compression may reduce visual/audio quality. Direct, publicly accessible video links are required.")
+    st.info("Example spreadsheet headers: Video link | Video name")
+    video_excel = st.file_uploader("Upload Excel/CSV with “Video link” and “Video name” columns", type=["xlsx", "xlsm", "csv"], key="server_video_excel_upload")
+    if video_excel is not None and st.button("Download and Compress Videos", type="primary", key="server_video_process"):
+        try:
+            with st.spinner("Downloading and compressing videos..."):
+                zip_data, successful_videos, failed_rows = _process_video_server_side(video_excel)
+            st.success(f"Processed {len(successful_videos)} video(s); {len(failed_rows)} row(s) failed.")
+            st.download_button("Download MP4 Videos + Audit Log (.ZIP)", data=zip_data, file_name="Shopee_Compressed_Videos_From_Excel.zip", mime="application/zip")
+            if failed_rows:
+                with st.expander(f"View failed rows ({len(failed_rows)})"):
+                    st.text("\n".join(failed_rows))
+            if successful_videos:
+                st.dataframe([{"Output Name": item["name"], "Original Resolution": item["original_resolution"], "Duration (seconds)": item["duration_seconds"], "Size (MB)": item["size_mb"], "Format": item["format"]} for item in successful_videos], use_container_width=True)
+        except Exception as exc:
+            st.error(f"Could not process this spreadsheet: {exc}")
 
 
 # 2. Inject HTML Canvas Tool into Streamlit
