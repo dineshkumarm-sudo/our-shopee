@@ -682,7 +682,7 @@ else:
                 auth_url = _drive_authorization_url()
                 # Use a same-tab top-level link so the OAuth callback can return to this browser session.
                 components.html(
-                    '<a href="' + auth_url + '" target="_top" '
+                    '<a href="' + auth_url + '" target="_blank" rel="noopener noreferrer" '
                     'style="display:inline-block;padding:0.6rem 1rem;border-radius:0.5rem;'
                     'background:#ff4b4b;color:white;text-decoration:none;font-weight:600;">'
                     'Connect Google Drive</a>',
