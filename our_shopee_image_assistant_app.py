@@ -283,18 +283,25 @@ MAX_VIDEO_OUTPUT_BYTES = 15_000_000
 
 
 def _download_video(url):
+    # Validate the submitted URL before any downloader is allowed to process it.
     parsed = _validate_public_url(url)
     host = (parsed.hostname or "").lower().rstrip(".")
-    if host == "vimeo.com" or host.endswith(".vimeo.com"):
-        # Vimeo page links are HTML pages, not direct video files. Use yt-dlp
-        # to resolve a permitted public/unlisted playback source.
-        try:
-            import yt_dlp
-        except ImportError as exc:
-            raise ValueError("Vimeo link support is not installed yet. Please wait for the app deployment to finish.") from exc
+    page_hosts = (
+        host == "youtube.com" or host.endswith(".youtube.com")
+        or host == "youtu.be"
+        or host == "vimeo.com" or host.endswith(".vimeo.com")
+        or host == "amazon.com" or host.endswith(".amazon.com")
+        or host == "amazon.com.au" or host.endswith(".amazon.com.au")
+    )
 
+    # Page links (YouTube, Vimeo, Amazon product videos, and other supported
+    # platforms) need an extractor; the page itself is not the video file.
+    # yt-dlp also supports many additional sites through its generic extractor.
+    extractor_error = None
+    try:
+        import yt_dlp
         with tempfile.TemporaryDirectory() as temp_dir:
-            output_template = os.path.join(temp_dir, "vimeo_source.%(ext)s")
+            output_template = os.path.join(temp_dir, "video_source.%(ext)s")
             options = {
                 "format": "bestvideo*+bestaudio/best",
                 "outtmpl": output_template,
@@ -311,28 +318,26 @@ def _download_video(url):
                 with yt_dlp.YoutubeDL(options) as ydl:
                     ydl.extract_info(url, download=True)
             except Exception as exc:
-                message = str(exc).splitlines()[0][:220]
-                raise ValueError(
-                    "Could not download this Vimeo video. Check that the link is accessible and that its owner permits access/download. Details: "
-                    + message
-                ) from exc
+                extractor_error = str(exc).splitlines()[0][:220]
+
             candidates = [
                 os.path.join(temp_dir, name)
                 for name in os.listdir(temp_dir)
                 if os.path.isfile(os.path.join(temp_dir, name))
                 and not name.endswith((".part", ".ytdl", ".json"))
             ]
-            if not candidates:
-                raise ValueError("Vimeo did not provide a downloadable video file for this link.")
-            source_path = max(candidates, key=os.path.getsize)
-            with open(source_path, "rb") as source_file:
-                data = source_file.read()
-            if not data:
-                raise ValueError("Vimeo returned an empty video file.")
-            if len(data) > MAX_VIDEO_BYTES:
-                raise ValueError("Source video exceeds the 1 GB download limit.")
-            return data
+            if candidates:
+                source_path = max(candidates, key=os.path.getsize)
+                with open(source_path, "rb") as source_file:
+                    data = source_file.read()
+                if data:
+                    if len(data) > MAX_VIDEO_BYTES:
+                        raise ValueError("Source video exceeds the 1 GB download limit.")
+                    return data
+    except ImportError:
+        extractor_error = "Video-page extraction is not installed in this deployment."
 
+    # If extraction did not work, still support ordinary direct video-file URLs.
     current_url = url
     headers = {"User-Agent": "OurShopeeVideoAssistant/1.0"}
     for _ in range(MAX_REDIRECTS + 1):
@@ -347,7 +352,12 @@ def _download_video(url):
             response.raise_for_status()
             content_type = response.headers.get("Content-Type", "").split(";")[0].lower()
             if content_type and not (content_type.startswith("video/") or content_type in ("application/octet-stream", "binary/octet-stream")):
-                raise ValueError("The URL did not return a video file. For Vimeo, provide the Vimeo page link; for other sites, use a direct video-file URL. Content-Type: " + content_type + ".")
+                detail = (" Extraction error: " + extractor_error) if extractor_error else ""
+                raise ValueError(
+                    "This link opens a webpage instead of a direct video file, and automatic extraction could not retrieve the video. "
+                    "Check that the video is publicly accessible and permitted for download, or provide a direct video URL/file."
+                    + detail + " Content-Type: " + content_type + "."
+                )
             chunks = []
             total = 0
             for chunk in response.iter_content(chunk_size=1024 * 256):
