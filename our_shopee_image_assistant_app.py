@@ -512,6 +512,15 @@ def _process_video_server_side(uploaded_file):
                 "Under 15 MB": "Yes" if len(item["bytes"]) <= MAX_VIDEO_OUTPUT_BYTES else "No",
             })
         archive.writestr("Shopee_Video_Processing_Log.csv", audit_buffer.getvalue())
+
+        # Keep a separate downloadable error log so failed rows are recorded
+        # inside the output package, not only shown on screen.
+        error_buffer = io.StringIO()
+        error_writer = csv.DictWriter(error_buffer, fieldnames=["Error Details"])
+        error_writer.writeheader()
+        for failure in failures:
+            error_writer.writerow({"Error Details": failure})
+        archive.writestr("Shopee_Video_Error_Log.csv", error_buffer.getvalue())
     return zip_buffer.getvalue(), output_rows, failures
 
 
