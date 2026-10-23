@@ -422,8 +422,30 @@ def _download_video(url):
     extractor_error = None
     try:
         import yt_dlp
+
+        class _YtDlpLogger:
+            def __init__(self):
+                self.messages = []
+
+            def debug(self, message):
+                self._save(message)
+
+            def warning(self, message):
+                self._save(message)
+
+            def error(self, message):
+                self._save(message)
+
+            def _save(self, message):
+                cleaned = re.sub(r"\\x1b\\[[0-?]*[ -/]*[@-~]", "", str(message))
+                cleaned = re.sub(r"[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f]", " ", cleaned)
+                cleaned = " ".join(cleaned.split())
+                if cleaned:
+                    self.messages.append(cleaned)
+
         with tempfile.TemporaryDirectory() as temp_dir:
             output_template = os.path.join(temp_dir, "video_source.%(ext)s")
+            yt_logger = _YtDlpLogger()
             options = {
                 "format": "bestvideo*+bestaudio/best",
                 "outtmpl": output_template,
@@ -434,17 +456,19 @@ def _download_video(url):
                 "retries": 2,
                 "fragment_retries": 2,
                 "quiet": True,
-                "no_warnings": True,
+                "no_warnings": False,
+                "logger": yt_logger,
             }
             try:
                 with yt_dlp.YoutubeDL(options) as ydl:
                     ydl.extract_info(url, download=True)
             except Exception as exc:
-                # Keep extractor diagnostics readable in the app and audit report.
-                raw_error = str(exc)
-                raw_error = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", raw_error)
-                raw_error = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", raw_error)
-                extractor_error = " ".join(raw_error.split())[:1200]
+                raw_error = re.sub(r"\\x1b\\[[0-?]*[ -/]*[@-~]", "", str(exc))
+                raw_error = re.sub(r"[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f]", " ", raw_error)
+                details = yt_logger.messages[-5:]
+                if raw_error.strip():
+                    details.append("Exception: " + " ".join(raw_error.split()))
+                extractor_error = " | ".join(details)[-1800:] or "The video extractor failed without returning diagnostic details."
 
             candidates = [
                 os.path.join(temp_dir, name)
@@ -478,7 +502,7 @@ def _download_video(url):
             response.raise_for_status()
             content_type = response.headers.get("Content-Type", "").split(";")[0].lower()
             if content_type and not (content_type.startswith("video/") or content_type in ("application/octet-stream", "binary/octet-stream")):
-                detail = (" Extraction error: " + extractor_error) if extractor_error else ""
+                detail = (" Extraction diagnostics: " + extractor_error) if extractor_error else ""
                 raise ValueError(
                     "This link opens a webpage instead of a direct video file, and automatic extraction could not retrieve the video. "
                     "Check that the video is publicly accessible and permitted for download, or provide a direct video URL/file."
