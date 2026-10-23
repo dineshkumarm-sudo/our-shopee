@@ -680,7 +680,14 @@ else:
             st.caption("Connect your company Google Workspace account to upload each compressed MP4 directly to Drive.")
             try:
                 auth_url = _drive_authorization_url()
-                st.link_button("Connect Google Drive", auth_url, type="primary")
+                # Use a same-tab top-level link so the OAuth callback can return to this browser session.
+                components.html(
+                    '<a href="' + auth_url + '" target="_top" '
+                    'style="display:inline-block;padding:0.6rem 1rem;border-radius:0.5rem;'
+                    'background:#ff4b4b;color:white;text-decoration:none;font-weight:600;">'
+                    'Connect Google Drive</a>',
+                    height=55,
+                )
             except Exception as exc:
                 st.warning(str(exc))
     drive_folder_id = st.text_input("Google Drive destination folder ID (optional)",
