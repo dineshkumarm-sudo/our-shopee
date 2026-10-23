@@ -202,11 +202,12 @@ def _download_image(url):
     raise ValueError("Image URL exceeded the redirect limit.")
 
 
-def _safe_output_name(value, fallback):
+def _safe_output_name(value, fallback, max_length=200):
     name = str(value or "").strip()
     name = __import__("re").sub(r"\.[^./\\]+$", "", name)
     name = __import__("re").sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).rstrip(". ").strip()
-    return name or fallback
+    name = name or fallback
+    return name[:max_length].rstrip(". ") or fallback
 
 
 def _optimize_image_bytes(image_bytes, output_name):
@@ -352,7 +353,8 @@ def _process_excel_server_side(uploaded_file):
             unique_name = base_name
             suffix = 2
             while (unique_name + ".webp").lower() in used_names:
-                unique_name = f"{base_name}_{suffix}"
+                suffix_text = f"_{suffix}"
+                unique_name = f"{base_name[:200 - len(suffix_text)]}{suffix_text}"
                 suffix += 1
             used_names.add((unique_name + ".webp").lower())
             result = _optimize_image_bytes(data, unique_name)
@@ -1080,11 +1082,12 @@ HTML_CONTENT = """
             tableContainer.classList.remove('hidden');
         }
 
-        function safeOutputBaseName(value, fallback) {
+        function safeOutputBaseName(value, fallback, maxLength = 200) {
             let name = String(value ?? '').trim();
             name = name.replace(/\.[^./\\]+$/, '');
             name = name.replace(/[\\/:*?"<>|\x00-\x1F]/g, '_').replace(/[. ]+$/g, '').trim();
-            return name || fallback || 'image';
+            name = name || fallback || 'image';
+            return name.slice(0, maxLength).replace(/[. ]+$/g, '') || fallback || 'image';
         }
 
         async function processExcelImages(excelFile) {
@@ -1158,7 +1161,10 @@ HTML_CONTENT = """
                     const baseName = safeOutputBaseName(rawName, "image_" + (i + 1));
                     let uniqueName = baseName;
                     let suffix = 2;
-                    while (usedNames.has((uniqueName + '.webp').toLowerCase())) uniqueName = baseName + '_' + suffix++;
+                    while (usedNames.has((uniqueName + '.webp').toLowerCase())) {
+                        const suffixText = '_' + suffix++;
+                        uniqueName = baseName.slice(0, 200 - suffixText.length) + suffixText;
+                    }
                     usedNames.add((uniqueName + '.webp').toLowerCase());
                     const ext = (blob.type.split('/')[1] || 'jpeg').replace('jpeg', 'jpg').replace('svg+xml', 'svg');
                     const imageFile = new File([blob], uniqueName + '.' + ext, { type: blob.type || 'image/jpeg' });
