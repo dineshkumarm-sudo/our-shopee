@@ -283,10 +283,60 @@ MAX_VIDEO_OUTPUT_BYTES = 15_000_000
 
 
 def _download_video(url):
+    parsed = _validate_public_url(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if host == "vimeo.com" or host.endswith(".vimeo.com"):
+        # Vimeo page links are HTML pages, not direct video files. Use yt-dlp
+        # to resolve a permitted public/unlisted playback source.
+        try:
+            import yt_dlp
+        except ImportError as exc:
+            raise ValueError("Vimeo link support is not installed yet. Please wait for the app deployment to finish.") from exc
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_template = os.path.join(temp_dir, "vimeo_source.%(ext)s")
+            options = {
+                "format": "bestvideo*+bestaudio/best",
+                "outtmpl": output_template,
+                "merge_output_format": "mp4",
+                "noplaylist": True,
+                "max_filesize": MAX_VIDEO_BYTES,
+                "socket_timeout": 60,
+                "retries": 2,
+                "fragment_retries": 2,
+                "quiet": True,
+                "no_warnings": True,
+            }
+            try:
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    ydl.extract_info(url, download=True)
+            except Exception as exc:
+                message = str(exc).splitlines()[0][:220]
+                raise ValueError(
+                    "Could not download this Vimeo video. Check that the link is accessible and that its owner permits access/download. Details: "
+                    + message
+                ) from exc
+            candidates = [
+                os.path.join(temp_dir, name)
+                for name in os.listdir(temp_dir)
+                if os.path.isfile(os.path.join(temp_dir, name))
+                and not name.endswith((".part", ".ytdl", ".json"))
+            ]
+            if not candidates:
+                raise ValueError("Vimeo did not provide a downloadable video file for this link.")
+            source_path = max(candidates, key=os.path.getsize)
+            with open(source_path, "rb") as source_file:
+                data = source_file.read()
+            if not data:
+                raise ValueError("Vimeo returned an empty video file.")
+            if len(data) > MAX_VIDEO_BYTES:
+                raise ValueError("Source video exceeds the 1 GB download limit.")
+            return data
+
     current_url = url
     headers = {"User-Agent": "OurShopeeVideoAssistant/1.0"}
     for _ in range(MAX_REDIRECTS + 1):
-        parsed = _validate_public_url(current_url)
+        _validate_public_url(current_url)
         with requests.get(current_url, headers=headers, timeout=(10, 60), stream=True, allow_redirects=False) as response:
             if response.is_redirect or response.is_permanent_redirect:
                 location = response.headers.get("Location")
@@ -297,7 +347,7 @@ def _download_video(url):
             response.raise_for_status()
             content_type = response.headers.get("Content-Type", "").split(";")[0].lower()
             if content_type and not (content_type.startswith("video/") or content_type in ("application/octet-stream", "binary/octet-stream")):
-                raise ValueError("The URL did not return a video (Content-Type: " + content_type + ").")
+                raise ValueError("The URL did not return a video file. For Vimeo, provide the Vimeo page link; for other sites, use a direct video-file URL. Content-Type: " + content_type + ".")
             chunks = []
             total = 0
             for chunk in response.iter_content(chunk_size=1024 * 256):
@@ -312,7 +362,6 @@ def _download_video(url):
                 raise ValueError("Downloaded video is empty.")
             return data
     raise ValueError("Video URL exceeded the redirect limit.")
-
 
 def _process_video_server_side(uploaded_file):
     raw = uploaded_file.getvalue()
