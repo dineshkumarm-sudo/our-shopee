@@ -437,8 +437,8 @@ def _download_video(url):
                 self._save(message)
 
             def _save(self, message):
-                cleaned = re.sub(r"\\x1b\\[[0-?]*[ -/]*[@-~]", "", str(message))
-                cleaned = re.sub(r"[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f]", " ", cleaned)
+                cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(message))
+                cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", cleaned)
                 cleaned = " ".join(cleaned.split())
                 if cleaned:
                     self.messages.append(cleaned)
@@ -463,8 +463,8 @@ def _download_video(url):
                 with yt_dlp.YoutubeDL(options) as ydl:
                     ydl.extract_info(url, download=True)
             except Exception as exc:
-                raw_error = re.sub(r"\\x1b\\[[0-?]*[ -/]*[@-~]", "", str(exc))
-                raw_error = re.sub(r"[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f]", " ", raw_error)
+                raw_error = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(exc))
+                raw_error = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", raw_error)
                 details = yt_logger.messages[-5:]
                 if raw_error.strip():
                     details.append("Exception: " + " ".join(raw_error.split()))
