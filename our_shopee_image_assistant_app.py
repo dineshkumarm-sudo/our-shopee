@@ -19,7 +19,9 @@ import json
 import os
 import subprocess
 import tempfile
-from urllib.parse import urlparse, urljoin
+import time
+import secrets
+from urllib.parse import urlparse, urljoin, urlencode
 
 import requests
 from PIL import Image, ImageOps, ImageFilter
@@ -27,6 +29,110 @@ from PIL import Image, ImageOps, ImageFilter
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 DOWNLOAD_TIMEOUT = (10, 30)
 MAX_REDIRECTS = 5
+DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+DRIVE_REDIRECT_URI = "https://our-shopee-6ep.streamlit.app/"
+
+
+def _drive_oauth_settings():
+    try:
+        config = st.secrets["google_drive"]
+        client_id = str(config["client_id"]).strip()
+        client_secret = str(config["client_secret"]).strip()
+        redirect_uri = str(config.get("redirect_uri", DRIVE_REDIRECT_URI)).strip()
+    except Exception as exc:
+        raise ValueError('Google Drive is not configured yet. Add [google_drive] with client_id, client_secret, and redirect_uri in Streamlit App Settings → Secrets.') from exc
+    if not client_id or not client_secret:
+        raise ValueError("Google Drive OAuth client ID or client secret is missing from Streamlit Secrets.")
+    if redirect_uri != DRIVE_REDIRECT_URI:
+        raise ValueError("The Google Drive redirect_uri in Streamlit Secrets must exactly match " + DRIVE_REDIRECT_URI)
+    return client_id, client_secret, redirect_uri
+
+
+def _drive_authorization_url():
+    client_id, _, redirect_uri = _drive_oauth_settings()
+    state = secrets.token_urlsafe(32)
+    st.session_state["drive_oauth_state"] = state
+    params = {"client_id": client_id, "redirect_uri": redirect_uri, "response_type": "code",
+              "scope": DRIVE_SCOPE, "access_type": "offline", "prompt": "consent",
+              "include_granted_scopes": "true", "state": state}
+    return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+
+
+def _handle_drive_oauth_callback():
+    try:
+        query = st.query_params
+        oauth_error, code, returned_state = query.get("error"), query.get("code"), query.get("state")
+        if oauth_error:
+            st.session_state["drive_oauth_notice"] = "Google authorization was not completed: " + str(oauth_error)
+            query.clear()
+        elif code:
+            expected_state = st.session_state.get("drive_oauth_state")
+            if not expected_state or not returned_state or not secrets.compare_digest(str(expected_state), str(returned_state)):
+                st.session_state["drive_oauth_notice"] = "Google authorization could not be verified. Please click Connect to Google Drive and try again."
+                query.clear()
+            else:
+                client_id, client_secret, redirect_uri = _drive_oauth_settings()
+                response = requests.post("https://oauth2.googleapis.com/token", data={
+                    "code": str(code), "client_id": client_id, "client_secret": client_secret,
+                    "redirect_uri": redirect_uri, "grant_type": "authorization_code"}, timeout=30)
+                if not response.ok:
+                    raise ValueError("Google token exchange failed: " + response.text[:300])
+                token_data = response.json()
+                old_token = st.session_state.get("drive_token", {})
+                st.session_state["drive_token"] = {
+                    "access_token": token_data.get("access_token"),
+                    "refresh_token": token_data.get("refresh_token") or old_token.get("refresh_token"),
+                    "expires_at": time.time() + int(token_data.get("expires_in", 3600)) - 60}
+                st.session_state.pop("drive_oauth_state", None)
+                st.session_state["drive_oauth_notice"] = "Google Drive connected for this browser session."
+                query.clear()
+    except Exception as exc:
+        st.session_state["drive_oauth_notice"] = "Could not complete Google Drive authorization: " + str(exc)[:300]
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+
+
+def _get_drive_access_token():
+    token = st.session_state.get("drive_token")
+    if not token:
+        raise ValueError("Connect Google Drive before uploading videos.")
+    if token.get("access_token") and time.time() < float(token.get("expires_at", 0)):
+        return token["access_token"]
+    refresh_token = token.get("refresh_token")
+    if not refresh_token:
+        raise ValueError("Google Drive authorization expired. Please disconnect and reconnect Google Drive.")
+    client_id, client_secret, _ = _drive_oauth_settings()
+    response = requests.post("https://oauth2.googleapis.com/token", data={
+        "client_id": client_id, "client_secret": client_secret,
+        "refresh_token": refresh_token, "grant_type": "refresh_token"}, timeout=30)
+    if not response.ok:
+        raise ValueError("Could not refresh Google Drive authorization: " + response.text[:300])
+    refreshed = response.json()
+    token["access_token"] = refreshed["access_token"]
+    token["expires_at"] = time.time() + int(refreshed.get("expires_in", 3600)) - 60
+    st.session_state["drive_token"] = token
+    return token["access_token"]
+
+
+def _upload_video_to_drive(file_path, filename, folder_id=""):
+    access_token = _get_drive_access_token()
+    metadata = {"name": filename, "mimeType": "video/mp4"}
+    if str(folder_id or "").strip():
+        metadata["parents"] = [str(folder_id).strip()]
+    with open(file_path, "rb") as video_file:
+        response = requests.post(
+            "https://www.googleapis.com/upload/drive/v3/files",
+            params={"uploadType": "multipart", "fields": "id,name,webViewLink", "supportsAllDrives": "true"},
+            headers={"Authorization": "Bearer " + access_token},
+            files={"metadata": (None, json.dumps(metadata), "application/json; charset=UTF-8"),
+                   "file": (filename, video_file, "video/mp4")},
+            timeout=(30, 900))
+    if not response.ok:
+        raise ValueError("Google Drive upload failed: " + response.text[:350])
+    result = response.json()
+    return result.get("webViewLink") or ("https://drive.google.com/file/d/" + result["id"] + "/view")
 
 
 def _validate_public_url(url):
@@ -373,7 +479,7 @@ def _download_video(url):
             return data
     raise ValueError("Video URL exceeded the redirect limit.")
 
-def _process_video_server_side(uploaded_file):
+def _process_video_server_side(uploaded_file, upload_to_drive=False, drive_folder_id=""):
     raw = uploaded_file.getvalue()
     if uploaded_file.name.lower().endswith((".xlsx", ".xlsm")):
         workbook = __import__("openpyxl").load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
@@ -475,24 +581,47 @@ def _process_video_server_side(uploaded_file):
                 if not last_size or last_size > MAX_VIDEO_OUTPUT_BYTES:
                     raise ValueError("Could not compress this video to 15 MB or less without changing its resolution.")
 
-                with open(output_path, "rb") as output_file:
-                    encoded_data = output_file.read()
+                if upload_to_drive:
+                    drive_url = _upload_video_to_drive(output_path, unique_name + ".mp4", drive_folder_id)
+                    final_size = os.path.getsize(output_path)
+                    encoded_data = None
+                else:
+                    with open(output_path, "rb") as output_file:
+                        encoded_data = output_file.read()
+                    final_size = len(encoded_data)
+                    drive_url = ""
 
-            output_rows.append({
-                "name": unique_name + ".mp4",
-                "bytes": encoded_data,
-                "original_name": raw_name,
-                "original_resolution": f"{width}x{height}",
-                "duration_seconds": round(duration, 2),
-                "size_mb": round(len(encoded_data) / (1024 * 1024), 2),
-                "format": "MP4",
-            })
+            output_item = {"name": unique_name + ".mp4", "original_name": raw_name,
+                           "original_resolution": f"{width}x{height}",
+                           "duration_seconds": round(duration, 2),
+                           "size_mb": round(final_size / (1024 * 1024), 2), "format": "MP4"}
+            if upload_to_drive:
+                output_item["drive_url"] = drive_url
+                output_item["status"] = "Uploaded"
+            else:
+                output_item["bytes"] = encoded_data
+                output_item["status"] = "Processed"
+            output_rows.append(output_item)
         except Exception as exc:
             failures.append(f"Row {sheet_row} ({raw_name or 'unnamed'}): {str(exc)[:250]}")
         progress.progress((index + 1) / max(1, len(active_rows)))
 
     status.write(f"Completed: {len(output_rows)} successful, {len(failures)} failed.")
     progress.empty()
+    if upload_to_drive:
+        report_buffer = io.StringIO()
+        fields = ["Original Name", "Output MP4 Name", "Status", "Original Resolution", "Duration (seconds)", "Format", "Final Size (MB)", "Drive Link", "Error Details"]
+        writer = csv.DictWriter(report_buffer, fieldnames=fields)
+        writer.writeheader()
+        for item in output_rows:
+            writer.writerow({"Original Name": item["original_name"], "Output MP4 Name": item["name"],
+                "Status": item["status"], "Original Resolution": item["original_resolution"],
+                "Duration (seconds)": item["duration_seconds"], "Format": item["format"],
+                "Final Size (MB)": item["size_mb"], "Drive Link": item.get("drive_url", ""), "Error Details": ""})
+        for failure in failures:
+            writer.writerow({"Status": "Failed", "Error Details": failure})
+        return report_buffer.getvalue().encode("utf-8-sig"), output_rows, failures
+
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         for item in output_rows:
@@ -502,19 +631,11 @@ def _process_video_server_side(uploaded_file):
         writer = csv.DictWriter(audit_buffer, fieldnames=fields)
         writer.writeheader()
         for item in output_rows:
-            writer.writerow({
-                "Original Name": item["original_name"],
-                "Output MP4 Name": item["name"],
-                "Original Resolution": item["original_resolution"],
-                "Duration (seconds)": item["duration_seconds"],
-                "Format": item["format"],
-                "Final Size (MB)": item["size_mb"],
-                "Under 15 MB": "Yes" if len(item["bytes"]) <= MAX_VIDEO_OUTPUT_BYTES else "No",
-            })
+            writer.writerow({"Original Name": item["original_name"], "Output MP4 Name": item["name"],
+                "Original Resolution": item["original_resolution"], "Duration (seconds)": item["duration_seconds"],
+                "Format": item["format"], "Final Size (MB)": item["size_mb"],
+                "Under 15 MB": "Yes" if item["size_mb"] <= 15 else "No"})
         archive.writestr("Shopee_Video_Processing_Log.csv", audit_buffer.getvalue())
-
-        # Keep a separate downloadable error log so failed rows are recorded
-        # inside the output package, not only shown on screen.
         error_buffer = io.StringIO()
         error_writer = csv.DictWriter(error_buffer, fieldnames=["Error Details"])
         error_writer.writeheader()
@@ -523,6 +644,8 @@ def _process_video_server_side(uploaded_file):
         archive.writestr("Shopee_Video_Error_Log.csv", error_buffer.getvalue())
     return zip_buffer.getvalue(), output_rows, failures
 
+
+_handle_drive_oauth_callback()
 
 st.markdown("### Excel Import — Image or Video")
 import_mode = st.selectbox("Choose what you want to process", ["Images", "Videos"], key="server_import_mode")
@@ -544,19 +667,54 @@ if import_mode == "Images":
             st.error(f"Could not process this spreadsheet: {exc}")
 else:
     st.caption("Video mode: uses “Video link” and “Video name” columns. Output is MP4, kept at the original resolution, and compressed to 15 MB or less. Compression may reduce visual/audio quality. Direct, publicly accessible video links are required.")
+    if st.session_state.get("drive_oauth_notice"):
+        st.info(st.session_state.pop("drive_oauth_notice"))
+    drive_connected = bool(st.session_state.get("drive_token"))
+    with st.expander("Google Drive connection", expanded=not drive_connected):
+        if drive_connected:
+            st.success("Google Drive is connected for this browser session.")
+            if st.button("Disconnect Google Drive", key="disconnect_drive"):
+                st.session_state.pop("drive_token", None)
+                st.rerun()
+        else:
+            st.caption("Connect your company Google Workspace account to upload each compressed MP4 directly to Drive.")
+            try:
+                auth_url = _drive_authorization_url()
+                st.link_button("Connect Google Drive", auth_url, type="primary")
+            except Exception as exc:
+                st.warning(str(exc))
+    drive_folder_id = st.text_input("Google Drive destination folder ID (optional)",
+        placeholder="Leave blank to upload to My Drive root",
+        help="Open the destination folder in Google Drive and copy the text after /folders/ in its URL. The folder must be accessible to the account you connect.",
+        key="drive_folder_id")
+    output_destination = st.radio("Video output destination",
+        ["Download ZIP", "Upload directly to Google Drive"],
+        index=1 if drive_connected else 0, horizontal=True, key="video_output_destination")
+    upload_directly = output_destination == "Upload directly to Google Drive"
+    if upload_directly and not drive_connected:
+        st.warning("Connect Google Drive above before starting a direct upload.")
     st.info("Example spreadsheet headers: Video link | Video name")
     video_excel = st.file_uploader("Upload Excel/CSV with “Video link” and “Video name” columns", type=["xlsx", "xlsm", "csv"], key="server_video_excel_upload")
-    if video_excel is not None and st.button("Download and Compress Videos", type="primary", key="server_video_process"):
+    if video_excel is not None and st.button(
+        "Upload and Compress Videos to Drive" if upload_directly else "Download and Compress Videos",
+        type="primary", key="server_video_process", disabled=(upload_directly and not drive_connected)):
         try:
-            with st.spinner("Downloading and compressing videos..."):
-                zip_data, successful_videos, failed_rows = _process_video_server_side(video_excel)
+            with st.spinner("Downloading, compressing, and uploading videos..." if upload_directly else "Downloading and compressing videos..."):
+                result_data, successful_videos, failed_rows = _process_video_server_side(
+                    video_excel, upload_to_drive=upload_directly, drive_folder_id=drive_folder_id)
             st.success(f"Processed {len(successful_videos)} video(s); {len(failed_rows)} row(s) failed.")
-            st.download_button("Download MP4 Videos + Audit Log (.ZIP)", data=zip_data, file_name="Shopee_Compressed_Videos_From_Excel.zip", mime="application/zip")
+            if upload_directly:
+                st.download_button("Download Drive Upload Report (.CSV)", data=result_data, file_name="Shopee_Drive_Upload_Report.csv", mime="text/csv")
+            else:
+                st.download_button("Download MP4 Videos + Audit Log (.ZIP)", data=result_data, file_name="Shopee_Compressed_Videos_From_Excel.zip", mime="application/zip")
             if failed_rows:
                 with st.expander(f"View failed rows ({len(failed_rows)})"):
                     st.text("\n".join(failed_rows))
             if successful_videos:
-                st.dataframe([{"Output Name": item["name"], "Original Resolution": item["original_resolution"], "Duration (seconds)": item["duration_seconds"], "Size (MB)": item["size_mb"], "Format": item["format"]} for item in successful_videos], use_container_width=True)
+                st.dataframe([{"Output Name": item["name"], "Original Resolution": item["original_resolution"],
+                    "Duration (seconds)": item["duration_seconds"], "Size (MB)": item["size_mb"], "Format": item["format"],
+                    **({"Drive Link": item["drive_url"]} if upload_directly else {})}
+                    for item in successful_videos], use_container_width=True)
         except Exception as exc:
             st.error(f"Could not process this spreadsheet: {exc}")
 
