@@ -17,6 +17,7 @@ import socket
 import zipfile
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -439,7 +440,11 @@ def _download_video(url):
                 with yt_dlp.YoutubeDL(options) as ydl:
                     ydl.extract_info(url, download=True)
             except Exception as exc:
-                extractor_error = " ".join(str(exc).split())[:500]
+                # Keep extractor diagnostics readable in the app and audit report.
+                raw_error = str(exc)
+                raw_error = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", raw_error)
+                raw_error = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", raw_error)
+                extractor_error = " ".join(raw_error.split())[:1200]
 
             candidates = [
                 os.path.join(temp_dir, name)
@@ -730,8 +735,9 @@ else:
             else:
                 st.download_button("Download MP4 Videos + Audit Log (.ZIP)", data=result_data, file_name="Shopee_Compressed_Videos_From_Excel.zip", mime="application/zip")
             if failed_rows:
-                with st.expander(f"View failed rows ({len(failed_rows)})"):
-                    st.text("\n".join(failed_rows))
+                with st.expander(f"View failed rows ({len(failed_rows)})", expanded=True):
+                    for failure in failed_rows:
+                        st.code(failure, language=None)
             if successful_videos:
                 st.dataframe([{"Output Name": item["name"], "Original Resolution": item["original_resolution"],
                     "Duration (seconds)": item["duration_seconds"], "Size (MB)": item["size_mb"], "Format": item["format"],
