@@ -279,7 +279,7 @@ def _process_excel_server_side(uploaded_file):
 
 
 MAX_VIDEO_BYTES = 1024 * 1024 * 1024
-MAX_VIDEO_OUTPUT_BYTES = 15 * 1024 * 1024
+MAX_VIDEO_OUTPUT_BYTES = 15_000_000
 
 
 def _download_video(url):
