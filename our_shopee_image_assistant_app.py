@@ -318,7 +318,7 @@ def _download_video(url):
                 with yt_dlp.YoutubeDL(options) as ydl:
                     ydl.extract_info(url, download=True)
             except Exception as exc:
-                extractor_error = str(exc).splitlines()[0][:220]
+                extractor_error = " ".join(str(exc).split())[:500]
 
             candidates = [
                 os.path.join(temp_dir, name)
