@@ -362,7 +362,7 @@ def _process_excel_server_side(uploaded_file, upload_to_drive=False, drive_folde
                 try:
                     result["drive_url"] = _upload_image_to_drive(result["bytes"], result["name"], drive_folder_id)
                 except Exception as upload_exc:
-                    failures.append(f"Row {sheet_row} (${raw_name or 'unnamed'}): processed locally, but Google Drive upload failed: {str(upload_exc)[:500]}")
+                    failures.append(f"Row {sheet_row} ({raw_name or 'unnamed'}): processed locally, but Google Drive upload failed: {str(upload_exc)[:500]}")
             output_rows.append(result)
             counts["resized"] += 1
             if len(result["bytes"]) <= 49 * 1024:
