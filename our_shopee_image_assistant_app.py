@@ -412,120 +412,6 @@ def _process_excel_server_side(uploaded_file, upload_to_drive=False, drive_folde
 
 _handle_drive_oauth_callback()
 
-st.markdown("### Import Images from Excel")
-st.caption("Uses “Image link” and “Image name” columns. Images are processed to a 1000×1000 canvas, WebP, and 49 KB or less. Low-resolution images are enlarged, but upscaling cannot restore missing source detail.")
-
-if st.session_state.get("drive_oauth_notice"):
-    st.info(st.session_state.pop("drive_oauth_notice"))
-
-drive_connected = bool(st.session_state.get("drive_token"))
-with st.expander("Google Drive connection", expanded=not drive_connected):
-    if drive_connected:
-        st.success("Google Drive is connected for this browser session.")
-        if st.button("Disconnect Google Drive", key="disconnect_drive"):
-            st.session_state.pop("drive_token", None)
-            st.rerun()
-    else:
-        st.caption("Connect your Google account to upload optimized WebP images directly to Drive.")
-        try:
-            auth_url = _drive_authorization_url()
-            components.html(
-                '<a href="' + auth_url + '" target="_blank" rel="noopener noreferrer" '
-                'style="display:inline-block;padding:0.6rem 1rem;border-radius:0.5rem;'
-                'background:#ff4b4b;color:white;text-decoration:none;font-weight:600;">'
-                'Connect Google Drive</a>',
-                height=55,
-            )
-        except Exception as exc:
-            st.warning(str(exc))
-
-drive_folder_id = st.text_input(
-    "Google Drive destination folder ID (optional)",
-    placeholder="Leave blank to upload to My Drive root",
-    help="Open the destination folder in Google Drive and copy the text after /folders/ in its URL. The folder must be accessible to the account you connect.",
-    key="drive_folder_id",
-)
-output_destination = st.radio(
-    "Image output destination",
-    ["Download ZIP", "Upload directly to Google Drive"],
-    index=1 if drive_connected else 0,
-    horizontal=True,
-    key="image_output_destination",
-)
-upload_images_to_drive = output_destination == "Upload directly to Google Drive"
-if upload_images_to_drive and not drive_connected:
-    st.warning("Connect Google Drive above before starting a direct upload.")
-
-server_excel = st.file_uploader(
-    'Upload Excel/CSV with “Image link” and “Image name” columns',
-    type=["xlsx", "xlsm", "csv"],
-    key="server_excel_upload",
-)
-if server_excel is not None and st.button(
-    "Optimize Images and Upload to Drive" if upload_images_to_drive else "Download and Optimize Images",
-    type="primary",
-    key="server_excel_process",
-    disabled=(upload_images_to_drive and not drive_connected),
-):
-    try:
-        with st.spinner(
-            "Processing and uploading optimized images to Google Drive..." if upload_images_to_drive
-            else "Processing spreadsheet images..."
-        ):
-            zip_data, successful_images, failed_rows = _process_excel_server_side(
-                server_excel,
-                upload_to_drive=upload_images_to_drive,
-                drive_folder_id=drive_folder_id,
-            )
-        st.success(f"Processed {len(successful_images)} image(s); {len(failed_rows)} row(s) failed or need attention.")
-        if upload_images_to_drive:
-            report = io.StringIO()
-            report_fields = ["Output Name", "Original Name", "Original Resolution", "Final Canvas", "Size (KB)", "Quality", "Drive Link"]
-            writer = csv.DictWriter(report, fieldnames=report_fields)
-            writer.writeheader()
-            for item in successful_images:
-                writer.writerow({
-                    "Output Name": item["name"],
-                    "Original Name": item["original_name"],
-                    "Original Resolution": item["original_resolution"],
-                    "Final Canvas": item["final_canvas"],
-                    "Size (KB)": item["size_kb"],
-                    "Quality": item["quality"],
-                    "Drive Link": item.get("drive_url", ""),
-                })
-            st.download_button(
-                "Download Drive Upload Report (.CSV)",
-                data=report.getvalue().encode("utf-8-sig"),
-                file_name="Shopee_Image_Drive_Upload_Report.csv",
-                mime="text/csv",
-            )
-            st.caption("If a row has a blank Drive Link, check the failed-row details below; its image may have processed but failed to upload.")
-        else:
-            st.download_button(
-                "Download Optimized Images + Audit Log (.ZIP)",
-                data=zip_data,
-                file_name="Shopee_Optimized_Images_From_Excel.zip",
-                mime="application/zip",
-            )
-        if failed_rows:
-            with st.expander(f"View failed rows ({len(failed_rows)})", expanded=True):
-                st.text("\n".join(failed_rows))
-        if successful_images:
-            st.dataframe([{
-                "Output Name": item["name"],
-                "Original Resolution": item["original_resolution"],
-                "Final Canvas": item["final_canvas"],
-                "Size (KB)": item["size_kb"],
-                "Quality": item["quality"],
-                "Upscaled": item["upscaled"],
-                "White Background": item["white_background_detected"],
-                "May Be Stretched": item["may_be_stretched"],
-                **({"Drive Link": item.get("drive_url", "")} if upload_images_to_drive else {}),
-                "Comment": item["background_note"],
-            } for item in successful_images], use_container_width=True)
-    except Exception as exc:
-        st.error(f"Could not process this spreadsheet: {exc}")
-
 
 # 2. Inject HTML Canvas Tool into Streamlit
 HTML_CONTENT = """
@@ -604,7 +490,7 @@ HTML_CONTENT = """
         </div>
 
         <!-- Excel URL Import -->
-        <div class="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
+        <div id="legacyExcelUploadPanel" class="hidden bg-white border border-slate-200 rounded-2xl p-6 shadow-sm" aria-hidden="true">
             <h2 class="text-lg font-bold text-slate-800">Import Images from Excel</h2>
             <p class="text-sm text-slate-600 mt-1 mb-4">Upload an .xlsx, .xls, or .csv file with columns named <strong>Image link</strong> and <strong>Image name</strong>. Images will be downloaded, optimized using the same settings, and saved using the names in the second column.</p>
             <div class="flex flex-col sm:flex-row gap-3 items-start sm:items-center">
@@ -1156,3 +1042,116 @@ HTML_CONTENT = """
 
 # Render full screen component
 components.html(HTML_CONTENT, height=1200, scrolling=True)
+
+# Excel/CSV URL workflow and optional Google Drive upload
+if st.session_state.get("drive_oauth_notice"):
+    st.info(st.session_state.pop("drive_oauth_notice"))
+
+drive_connected = bool(st.session_state.get("drive_token"))
+with st.expander("Google Drive connection", expanded=not drive_connected):
+    if drive_connected:
+        st.success("Google Drive is connected for this browser session.")
+        if st.button("Disconnect Google Drive", key="disconnect_drive"):
+            st.session_state.pop("drive_token", None)
+            st.rerun()
+    else:
+        st.caption("Connect your Google account to upload optimized WebP images directly to Drive.")
+        try:
+            auth_url = _drive_authorization_url()
+            components.html(
+                '<a href="' + auth_url + '" target="_blank" rel="noopener noreferrer" '
+                'style="display:inline-block;padding:0.6rem 1rem;border-radius:0.5rem;'
+                'background:#ff4b4b;color:white;text-decoration:none;font-weight:600;">'
+                'Connect Google Drive</a>',
+                height=55,
+            )
+        except Exception as exc:
+            st.warning(str(exc))
+
+drive_folder_id = st.text_input(
+    "Google Drive destination folder ID (optional)",
+    placeholder="Leave blank to upload to My Drive root",
+    help="Open the destination folder in Google Drive and copy the text after /folders/ in its URL. The folder must be accessible to the account you connect.",
+    key="drive_folder_id",
+)
+output_destination = st.radio(
+    "Image output destination",
+    ["Download ZIP", "Upload directly to Google Drive"],
+    index=1 if drive_connected else 0,
+    horizontal=True,
+    key="image_output_destination",
+)
+upload_images_to_drive = output_destination == "Upload directly to Google Drive"
+if upload_images_to_drive and not drive_connected:
+    st.warning("Connect Google Drive above before starting a direct upload.")
+
+server_excel = st.file_uploader(
+    'Upload Excel/CSV with “Image link” and “Image name” columns',
+    type=["xlsx", "xlsm", "csv"],
+    key="server_excel_upload",
+)
+if server_excel is not None and st.button(
+    "Optimize Images and Upload to Drive" if upload_images_to_drive else "Download and Optimize Images",
+    type="primary",
+    key="server_excel_process",
+    disabled=(upload_images_to_drive and not drive_connected),
+):
+    try:
+        with st.spinner(
+            "Processing and uploading optimized images to Google Drive..." if upload_images_to_drive
+            else "Processing spreadsheet images..."
+        ):
+            zip_data, successful_images, failed_rows = _process_excel_server_side(
+                server_excel,
+                upload_to_drive=upload_images_to_drive,
+                drive_folder_id=drive_folder_id,
+            )
+        st.success(f"Processed {len(successful_images)} image(s); {len(failed_rows)} row(s) failed or need attention.")
+        if upload_images_to_drive:
+            report = io.StringIO()
+            report_fields = ["Output Name", "Original Name", "Original Resolution", "Final Canvas", "Size (KB)", "Quality", "Drive Link"]
+            writer = csv.DictWriter(report, fieldnames=report_fields)
+            writer.writeheader()
+            for item in successful_images:
+                writer.writerow({
+                    "Output Name": item["name"],
+                    "Original Name": item["original_name"],
+                    "Original Resolution": item["original_resolution"],
+                    "Final Canvas": item["final_canvas"],
+                    "Size (KB)": item["size_kb"],
+                    "Quality": item["quality"],
+                    "Drive Link": item.get("drive_url", ""),
+                })
+            st.download_button(
+                "Download Drive Upload Report (.CSV)",
+                data=report.getvalue().encode("utf-8-sig"),
+                file_name="Shopee_Image_Drive_Upload_Report.csv",
+                mime="text/csv",
+            )
+            st.caption("If a row has a blank Drive Link, check the failed-row details below; its image may have processed but failed to upload.")
+        else:
+            st.download_button(
+                "Download Optimized Images + Audit Log (.ZIP)",
+                data=zip_data,
+                file_name="Shopee_Optimized_Images_From_Excel.zip",
+                mime="application/zip",
+            )
+        if failed_rows:
+            with st.expander(f"View failed rows ({len(failed_rows)})", expanded=True):
+                st.text("\n".join(failed_rows))
+        if successful_images:
+            st.dataframe([{
+                "Output Name": item["name"],
+                "Original Resolution": item["original_resolution"],
+                "Final Canvas": item["final_canvas"],
+                "Size (KB)": item["size_kb"],
+                "Quality": item["quality"],
+                "Upscaled": item["upscaled"],
+                "White Background": item["white_background_detected"],
+                "May Be Stretched": item["may_be_stretched"],
+                **({"Drive Link": item.get("drive_url", "")} if upload_images_to_drive else {}),
+                "Comment": item["background_note"],
+            } for item in successful_images], use_container_width=True)
+    except Exception as exc:
+        st.error(f"Could not process this spreadsheet: {exc}")
+
