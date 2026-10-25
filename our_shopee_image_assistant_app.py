@@ -1041,7 +1041,7 @@ HTML_CONTENT = """
 """
 
 # Render full screen component
-components.html(HTML_CONTENT, height=650, scrolling=True)
+components.html(HTML_CONTENT, height=430, scrolling=True)
 
 # Excel/CSV URL workflow and optional Google Drive upload
 if st.session_state.get("drive_oauth_notice"):
