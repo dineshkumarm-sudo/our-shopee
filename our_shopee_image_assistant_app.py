@@ -16,10 +16,6 @@ import ipaddress
 import socket
 import zipfile
 import json
-import os
-import re
-import subprocess
-import tempfile
 import time
 import secrets
 import hashlib
@@ -113,7 +109,7 @@ def _handle_drive_oauth_callback():
 def _get_drive_access_token():
     token = st.session_state.get("drive_token")
     if not token:
-        raise ValueError("Connect Google Drive before uploading videos.")
+        raise ValueError("Connect Google Drive before uploading images.")
     if token.get("access_token") and time.time() < float(token.get("expires_at", 0)):
         return token["access_token"]
     refresh_token = token.get("refresh_token")
@@ -132,19 +128,21 @@ def _get_drive_access_token():
     return token["access_token"]
 
 
-def _upload_video_to_drive(file_path, filename, folder_id=""):
+def _upload_image_to_drive(image_bytes, filename, folder_id=""):
+    """Upload an optimized WebP image to the connected user's Google Drive."""
     access_token = _get_drive_access_token()
-    metadata = {"name": filename, "mimeType": "video/mp4"}
+    metadata = {"name": filename, "mimeType": "image/webp"}
     if str(folder_id or "").strip():
         metadata["parents"] = [str(folder_id).strip()]
-    with open(file_path, "rb") as video_file:
-        response = requests.post(
-            "https://www.googleapis.com/upload/drive/v3/files",
-            params={"uploadType": "multipart", "fields": "id,name,webViewLink", "supportsAllDrives": "true"},
-            headers={"Authorization": "Bearer " + access_token},
-            files={"metadata": (None, json.dumps(metadata), "application/json; charset=UTF-8"),
-                   "file": (filename, video_file, "video/mp4")},
-            timeout=(30, 900))
+    response = requests.post(
+        "https://www.googleapis.com/upload/drive/v3/files",
+        params={"uploadType": "multipart", "fields": "id,name,webViewLink", "supportsAllDrives": "true"},
+        headers={"Authorization": "Bearer " + access_token},
+        files={
+            "metadata": (None, json.dumps(metadata), "application/json; charset=UTF-8"),
+            "file": (filename, io.BytesIO(image_bytes), "image/webp"),
+        },
+        timeout=(30, 180))
     if not response.ok:
         raise ValueError("Google Drive upload failed: " + response.text[:350])
     result = response.json()
@@ -285,7 +283,7 @@ def _optimize_image_bytes(image_bytes, output_name):
         }
 
 
-def _process_excel_server_side(uploaded_file):
+def _process_excel_server_side(uploaded_file, upload_to_drive=False, drive_folder_id=''):
     raw = uploaded_file.getvalue()
     workbook = __import__("openpyxl").load_workbook(io.BytesIO(raw), read_only=True, data_only=True) if uploaded_file.name.lower().endswith((".xlsx", ".xlsm")) else None
     if workbook:
@@ -359,6 +357,12 @@ def _process_excel_server_side(uploaded_file):
             used_names.add((unique_name + ".webp").lower())
             result = _optimize_image_bytes(data, unique_name)
             result["original_name"] = raw_name
+            result["drive_url"] = ""
+            if upload_to_drive:
+                try:
+                    result["drive_url"] = _upload_image_to_drive(result["bytes"], result["name"], drive_folder_id)
+                except Exception as upload_exc:
+                    failures.append(f"Row {sheet_row} (${raw_name or 'unnamed'}): processed locally, but Google Drive upload failed: {str(upload_exc)[:500]}")
             output_rows.append(result)
             counts["resized"] += 1
             if len(result["bytes"]) <= 49 * 1024:
@@ -378,7 +382,7 @@ def _process_excel_server_side(uploaded_file):
         for item in output_rows:
             archive.writestr(item["name"], item["bytes"])
         audit_buffer = io.StringIO()
-        fields = ["Original Name", "Output WebP Name", "Original Resolution", "Final Canvas", "Format", "Final Size (KB)", "Quality Level (%)", "Under 50 KB", "Upscaled (< 600px)", "Content Scale (%)", "White Background Detected", "May Be Stretched", "Processing Comment"]
+        fields = ["Original Name", "Output WebP Name", "Original Resolution", "Final Canvas", "Format", "Final Size (KB)", "Quality Level (%)", "Under 50 KB", "Upscaled (< 600px)", "Content Scale (%)", "White Background Detected", "May Be Stretched", "Processing Comment"] + (["Drive Link"] if upload_to_drive else [])
         writer = csv.DictWriter(audit_buffer, fieldnames=fields)
         writer.writeheader()
         for item in output_rows:
@@ -396,6 +400,7 @@ def _process_excel_server_side(uploaded_file):
                 "White Background Detected": "Yes" if item.get("white_background_detected") else "No",
                 "May Be Stretched": "Yes" if item.get("may_be_stretched") else "No",
                 "Processing Comment": item.get("background_note", ""),
+                **({"Drive Link": item.get("drive_url", "")} if upload_to_drive else {}),
             })
         archive.writestr("Shopee_Image_Processing_Log.csv", audit_buffer.getvalue())
     return zip_buffer.getvalue(), output_rows, failures
@@ -403,375 +408,123 @@ def _process_excel_server_side(uploaded_file):
 
 
 
-MAX_VIDEO_BYTES = 1024 * 1024 * 1024
-MAX_VIDEO_OUTPUT_BYTES = 15_000_000
-
-
-def _download_video(url):
-    # Validate the submitted URL before any downloader is allowed to process it.
-    parsed = _validate_public_url(url)
-    host = (parsed.hostname or "").lower().rstrip(".")
-    page_hosts = (
-        host == "youtube.com" or host.endswith(".youtube.com")
-        or host == "youtu.be"
-        or host == "vimeo.com" or host.endswith(".vimeo.com")
-        or host == "amazon.com" or host.endswith(".amazon.com")
-        or host == "amazon.com.au" or host.endswith(".amazon.com.au")
-    )
-
-    # Page links (YouTube, Vimeo, Amazon product videos, and other supported
-    # platforms) need an extractor; the page itself is not the video file.
-    # yt-dlp also supports many additional sites through its generic extractor.
-    extractor_error = None
-    try:
-        import yt_dlp
-
-        class _YtDlpLogger:
-            def __init__(self):
-                self.messages = []
-
-            def debug(self, message):
-                self._save(message)
-
-            def warning(self, message):
-                self._save(message)
-
-            def error(self, message):
-                self._save(message)
-
-            def _save(self, message):
-                cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(message))
-                cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", cleaned)
-                cleaned = " ".join(cleaned.split())
-                if cleaned:
-                    self.messages.append(cleaned)
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            output_template = os.path.join(temp_dir, "video_source.%(ext)s")
-            yt_logger = _YtDlpLogger()
-            options = {
-                "format": "bestvideo*+bestaudio/best",
-                "outtmpl": output_template,
-                "merge_output_format": "mp4",
-                "noplaylist": True,
-                "max_filesize": MAX_VIDEO_BYTES,
-                "socket_timeout": 60,
-                "retries": 2,
-                "fragment_retries": 2,
-                "quiet": True,
-                "no_warnings": False,
-                "logger": yt_logger,
-            }
-            try:
-                with yt_dlp.YoutubeDL(options) as ydl:
-                    ydl.extract_info(url, download=True)
-            except Exception as exc:
-                raw_error = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(exc))
-                raw_error = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", raw_error)
-                details = yt_logger.messages[-5:]
-                if raw_error.strip():
-                    details.append("Exception: " + " ".join(raw_error.split()))
-                extractor_error = " | ".join(details)[-1800:] or "The video extractor failed without returning diagnostic details."
-
-            candidates = [
-                os.path.join(temp_dir, name)
-                for name in os.listdir(temp_dir)
-                if os.path.isfile(os.path.join(temp_dir, name))
-                and not name.endswith((".part", ".ytdl", ".json"))
-            ]
-            if candidates:
-                source_path = max(candidates, key=os.path.getsize)
-                with open(source_path, "rb") as source_file:
-                    data = source_file.read()
-                if data:
-                    if len(data) > MAX_VIDEO_BYTES:
-                        raise ValueError("Source video exceeds the 1 GB download limit.")
-                    return data
-    except ImportError:
-        extractor_error = "Video-page extraction is not installed in this deployment."
-
-    # If extraction did not work, still support ordinary direct video-file URLs.
-    current_url = url
-    headers = {"User-Agent": "OurShopeeVideoAssistant/1.0"}
-    for _ in range(MAX_REDIRECTS + 1):
-        _validate_public_url(current_url)
-        with requests.get(current_url, headers=headers, timeout=(10, 60), stream=True, allow_redirects=False) as response:
-            if response.is_redirect or response.is_permanent_redirect:
-                location = response.headers.get("Location")
-                if not location:
-                    raise ValueError("Video host returned a redirect without a destination.")
-                current_url = urljoin(current_url, location)
-                continue
-            response.raise_for_status()
-            content_type = response.headers.get("Content-Type", "").split(";")[0].lower()
-            if content_type and not (content_type.startswith("video/") or content_type in ("application/octet-stream", "binary/octet-stream")):
-                detail = (" Extraction diagnostics: " + extractor_error) if extractor_error else ""
-                raise ValueError(
-                    "This link opens a webpage instead of a direct video file, and automatic extraction could not retrieve the video. "
-                    "Check that the video is publicly accessible and permitted for download, or provide a direct video URL/file."
-                    + detail + " Content-Type: " + content_type + "."
-                )
-            chunks = []
-            total = 0
-            for chunk in response.iter_content(chunk_size=1024 * 256):
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total > MAX_VIDEO_BYTES:
-                    raise ValueError("Source video exceeds the 1 GB download limit.")
-                chunks.append(chunk)
-            data = b"".join(chunks)
-            if not data:
-                raise ValueError("Downloaded video is empty.")
-            return data
-    raise ValueError("Video URL exceeded the redirect limit.")
-
-def _process_video_server_side(uploaded_file, upload_to_drive=False, drive_folder_id=""):
-    raw = uploaded_file.getvalue()
-    if uploaded_file.name.lower().endswith((".xlsx", ".xlsm")):
-        workbook = __import__("openpyxl").load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
-        sheet = workbook.active
-        iterator = sheet.iter_rows(values_only=True)
-        header_row = next(iterator, None)
-        if not header_row:
-            raise ValueError("The spreadsheet is empty.")
-        headers = [str(value or "").strip().lower() for value in header_row]
-        rows = [dict(zip(headers, row)) for row in iterator]
-    elif uploaded_file.name.lower().endswith(".csv"):
-        reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig")))
-        if not reader.fieldnames:
-            raise ValueError("The CSV file is empty.")
-        rows = [{str(k or "").strip().lower(): v for k, v in row.items()} for row in reader]
-    else:
-        raise ValueError("Please upload an .xlsx or .csv file. Save legacy .xls files as .xlsx first.")
-
-    first_keys = rows[0].keys() if rows else []
-    url_key = next((key for key in first_keys if key == "video link"), None)
-    name_key = next((key for key in first_keys if key == "video name"), None)
-    if not url_key or not name_key:
-        raise ValueError('Required columns "Video link" and "Video name" were not found in the first worksheet.')
-
-    active_rows = [(idx + 2, row) for idx, row in enumerate(rows) if str(row.get(url_key) or "").strip() or str(row.get(name_key) or "").strip()]
-    output_rows = []
-    failures = []
-    used_names = set()
-    progress = st.progress(0)
-    status = st.empty()
-    for index, (sheet_row, row) in enumerate(active_rows):
-        url = str(row.get(url_key) or "").strip()
-        raw_name = str(row.get(name_key) or "").strip()
-        status.write(f"Downloading and compressing video {index + 1} of {len(active_rows)}...")
-        progress.progress(index / max(1, len(active_rows)))
-        if not url or not raw_name:
-            failures.append(f"Row {sheet_row}: Video link or Video name is blank.")
-            progress.progress((index + 1) / max(1, len(active_rows)))
-            continue
-        try:
-            video_data = _download_video(url)
-            base_name = _safe_output_name(raw_name, f"video_{index + 1}")
-            unique_name = base_name
-            suffix = 2
-            while (unique_name + ".mp4").lower() in used_names:
-                unique_name = f"{base_name}_{suffix}"
-                suffix += 1
-            used_names.add((unique_name + ".mp4").lower())
-
-            with tempfile.TemporaryDirectory() as temp_dir:
-                input_path = os.path.join(temp_dir, "source_video")
-                output_path = os.path.join(temp_dir, "compressed.mp4")
-                with open(input_path, "wb") as source_file:
-                    source_file.write(video_data)
-
-                probe = subprocess.run(
-                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                     "-show_entries", "stream=codec_type,width,height", "-of", "json", input_path],
-                    capture_output=True, text=True, timeout=60
-                )
-                if probe.returncode != 0:
-                    raise ValueError("Could not read video metadata. The link may not be a supported video file.")
-                metadata = json.loads(probe.stdout or "{}")
-                video_stream = next((s for s in metadata.get("streams", []) if s.get("codec_type") == "video"), None)
-                if not video_stream:
-                    raise ValueError("The downloaded file does not contain a video stream.")
-                duration = float(metadata.get("format", {}).get("duration") or 0)
-                if duration <= 0:
-                    raise ValueError("Could not determine video duration.")
-                width, height = int(video_stream["width"]), int(video_stream["height"])
-                if width % 2 or height % 2:
-                    raise ValueError(f"Video resolution {width}x{height} has an odd dimension; this MP4 encoding profile cannot preserve it safely.")
-
-                audio_exists = any(s.get("codec_type") == "audio" for s in metadata.get("streams", []))
-                audio_bitrate = 96000 if audio_exists else 0
-                target_total_bitrate = int((MAX_VIDEO_OUTPUT_BYTES * 8 / duration) * 0.86)
-                video_bitrate = max(100000, target_total_bitrate - audio_bitrate)
-                last_size = None
-                for attempt in range(8):
-                    command = [
-                        "ffmpeg", "-y", "-v", "error", "-i", input_path,
-                        "-map", "0:v:0", "-map", "0:a:0?",
-                        "-c:v", "libx264", "-preset", "medium",
-                        "-b:v", str(video_bitrate), "-maxrate", str(video_bitrate),
-                        "-bufsize", str(video_bitrate * 2), "-pix_fmt", "yuv420p",
-                        "-c:a", "aac", "-b:a", "96k", "-sn", "-dn",
-                        "-movflags", "+faststart", "-f", "mp4", output_path
-                    ]
-                    encoded = subprocess.run(command, capture_output=True, text=True, timeout=1800)
-                    if encoded.returncode != 0:
-                        message = (encoded.stderr or "FFmpeg encoding failed.").strip().splitlines()[-1]
-                        raise ValueError("Video conversion failed: " + message[:220])
-                    last_size = os.path.getsize(output_path)
-                    if last_size <= MAX_VIDEO_OUTPUT_BYTES:
-                        break
-                    video_bitrate = max(40000, int(video_bitrate * (MAX_VIDEO_OUTPUT_BYTES / last_size) * 0.88))
-                    if video_bitrate <= 40000 and last_size > MAX_VIDEO_OUTPUT_BYTES:
-                        break
-                if not last_size or last_size > MAX_VIDEO_OUTPUT_BYTES:
-                    raise ValueError("Could not compress this video to 15 MB or less without changing its resolution.")
-
-                if upload_to_drive:
-                    drive_url = _upload_video_to_drive(output_path, unique_name + ".mp4", drive_folder_id)
-                    final_size = os.path.getsize(output_path)
-                    encoded_data = None
-                else:
-                    with open(output_path, "rb") as output_file:
-                        encoded_data = output_file.read()
-                    final_size = len(encoded_data)
-                    drive_url = ""
-
-            output_item = {"name": unique_name + ".mp4", "original_name": raw_name,
-                           "original_resolution": f"{width}x{height}",
-                           "duration_seconds": round(duration, 2),
-                           "size_mb": round(final_size / (1024 * 1024), 2), "format": "MP4"}
-            if upload_to_drive:
-                output_item["drive_url"] = drive_url
-                output_item["status"] = "Uploaded"
-            else:
-                output_item["bytes"] = encoded_data
-                output_item["status"] = "Processed"
-            output_rows.append(output_item)
-        except Exception as exc:
-            failures.append(f"Row {sheet_row} ({raw_name or 'unnamed'}): {str(exc)[:250]}")
-        progress.progress((index + 1) / max(1, len(active_rows)))
-
-    status.write(f"Completed: {len(output_rows)} successful, {len(failures)} failed.")
-    progress.empty()
-    if upload_to_drive:
-        report_buffer = io.StringIO()
-        fields = ["Original Name", "Output MP4 Name", "Status", "Original Resolution", "Duration (seconds)", "Format", "Final Size (MB)", "Drive Link", "Error Details"]
-        writer = csv.DictWriter(report_buffer, fieldnames=fields)
-        writer.writeheader()
-        for item in output_rows:
-            writer.writerow({"Original Name": item["original_name"], "Output MP4 Name": item["name"],
-                "Status": item["status"], "Original Resolution": item["original_resolution"],
-                "Duration (seconds)": item["duration_seconds"], "Format": item["format"],
-                "Final Size (MB)": item["size_mb"], "Drive Link": item.get("drive_url", ""), "Error Details": ""})
-        for failure in failures:
-            writer.writerow({"Status": "Failed", "Error Details": failure})
-        return report_buffer.getvalue().encode("utf-8-sig"), output_rows, failures
-
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for item in output_rows:
-            archive.writestr(item["name"], item["bytes"])
-        audit_buffer = io.StringIO()
-        fields = ["Original Name", "Output MP4 Name", "Original Resolution", "Duration (seconds)", "Format", "Final Size (MB)", "Under 15 MB"]
-        writer = csv.DictWriter(audit_buffer, fieldnames=fields)
-        writer.writeheader()
-        for item in output_rows:
-            writer.writerow({"Original Name": item["original_name"], "Output MP4 Name": item["name"],
-                "Original Resolution": item["original_resolution"], "Duration (seconds)": item["duration_seconds"],
-                "Format": item["format"], "Final Size (MB)": item["size_mb"],
-                "Under 15 MB": "Yes" if item["size_mb"] <= 15 else "No"})
-        archive.writestr("Shopee_Video_Processing_Log.csv", audit_buffer.getvalue())
-        error_buffer = io.StringIO()
-        error_writer = csv.DictWriter(error_buffer, fieldnames=["Error Details"])
-        error_writer.writeheader()
-        for failure in failures:
-            error_writer.writerow({"Error Details": failure})
-        archive.writestr("Shopee_Video_Error_Log.csv", error_buffer.getvalue())
-    return zip_buffer.getvalue(), output_rows, failures
 
 
 _handle_drive_oauth_callback()
 
-st.markdown("### Excel Import — Image or Video")
-import_mode = st.selectbox("Choose what you want to process", ["Images", "Videos"], key="server_import_mode")
-if import_mode == "Images":
-    st.caption("Image mode: uses “Image link” and “Image name” columns. Images are processed to a 1000×1000 canvas, WebP, and 49 KB or less. Low-resolution images are enlarged, but upscaling cannot restore missing source detail.")
-    server_excel = st.file_uploader("Upload Excel/CSV with “Image link” and “Image name” columns", type=["xlsx", "xlsm", "csv"], key="server_excel_upload")
-    if server_excel is not None and st.button("Download and Optimize Images", type="primary", key="server_excel_process"):
+st.markdown("### Import Images from Excel")
+st.caption("Uses “Image link” and “Image name” columns. Images are processed to a 1000×1000 canvas, WebP, and 49 KB or less. Low-resolution images are enlarged, but upscaling cannot restore missing source detail.")
+
+if st.session_state.get("drive_oauth_notice"):
+    st.info(st.session_state.pop("drive_oauth_notice"))
+
+drive_connected = bool(st.session_state.get("drive_token"))
+with st.expander("Google Drive connection", expanded=not drive_connected):
+    if drive_connected:
+        st.success("Google Drive is connected for this browser session.")
+        if st.button("Disconnect Google Drive", key="disconnect_drive"):
+            st.session_state.pop("drive_token", None)
+            st.rerun()
+    else:
+        st.caption("Connect your Google account to upload optimized WebP images directly to Drive.")
         try:
-            with st.spinner("Processing spreadsheet images..."):
-                zip_data, successful_images, failed_rows = _process_excel_server_side(server_excel)
-            st.success(f"Processed {len(successful_images)} image(s); {len(failed_rows)} row(s) failed.")
-            st.download_button("Download Optimized Images + Audit Log (.ZIP)", data=zip_data, file_name="Shopee_Optimized_Images_From_Excel.zip", mime="application/zip")
-            if failed_rows:
-                with st.expander(f"View failed rows ({len(failed_rows)})"):
-                    st.text("\n".join(failed_rows))
-            if successful_images:
-                st.dataframe([{"Output Name": item["name"], "Original Resolution": item["original_resolution"], "Final Canvas": item["final_canvas"], "Size (KB)": item["size_kb"], "Quality": item["quality"], "Upscaled": item["upscaled"], "White Background": item["white_background_detected"], "May Be Stretched": item["may_be_stretched"], "Comment": item["background_note"]} for item in successful_images], use_container_width=True)
+            auth_url = _drive_authorization_url()
+            components.html(
+                '<a href="' + auth_url + '" target="_blank" rel="noopener noreferrer" '
+                'style="display:inline-block;padding:0.6rem 1rem;border-radius:0.5rem;'
+                'background:#ff4b4b;color:white;text-decoration:none;font-weight:600;">'
+                'Connect Google Drive</a>',
+                height=55,
+            )
         except Exception as exc:
-            st.error(f"Could not process this spreadsheet: {exc}")
-else:
-    st.caption("Video mode: uses “Video link” and “Video name” columns. Output is MP4, kept at the original resolution, and compressed to 15 MB or less. Compression may reduce visual/audio quality. Direct, publicly accessible video links are required.")
-    if st.session_state.get("drive_oauth_notice"):
-        st.info(st.session_state.pop("drive_oauth_notice"))
-    drive_connected = bool(st.session_state.get("drive_token"))
-    with st.expander("Google Drive connection", expanded=not drive_connected):
-        if drive_connected:
-            st.success("Google Drive is connected for this browser session.")
-            if st.button("Disconnect Google Drive", key="disconnect_drive"):
-                st.session_state.pop("drive_token", None)
-                st.rerun()
+            st.warning(str(exc))
+
+drive_folder_id = st.text_input(
+    "Google Drive destination folder ID (optional)",
+    placeholder="Leave blank to upload to My Drive root",
+    help="Open the destination folder in Google Drive and copy the text after /folders/ in its URL. The folder must be accessible to the account you connect.",
+    key="drive_folder_id",
+)
+output_destination = st.radio(
+    "Image output destination",
+    ["Download ZIP", "Upload directly to Google Drive"],
+    index=1 if drive_connected else 0,
+    horizontal=True,
+    key="image_output_destination",
+)
+upload_images_to_drive = output_destination == "Upload directly to Google Drive"
+if upload_images_to_drive and not drive_connected:
+    st.warning("Connect Google Drive above before starting a direct upload.")
+
+server_excel = st.file_uploader(
+    'Upload Excel/CSV with “Image link” and “Image name” columns',
+    type=["xlsx", "xlsm", "csv"],
+    key="server_excel_upload",
+)
+if server_excel is not None and st.button(
+    "Optimize Images and Upload to Drive" if upload_images_to_drive else "Download and Optimize Images",
+    type="primary",
+    key="server_excel_process",
+    disabled=(upload_images_to_drive and not drive_connected),
+):
+    try:
+        with st.spinner(
+            "Processing and uploading optimized images to Google Drive..." if upload_images_to_drive
+            else "Processing spreadsheet images..."
+        ):
+            zip_data, successful_images, failed_rows = _process_excel_server_side(
+                server_excel,
+                upload_to_drive=upload_images_to_drive,
+                drive_folder_id=drive_folder_id,
+            )
+        st.success(f"Processed {len(successful_images)} image(s); {len(failed_rows)} row(s) failed or need attention.")
+        if upload_images_to_drive:
+            report = io.StringIO()
+            report_fields = ["Output Name", "Original Name", "Original Resolution", "Final Canvas", "Size (KB)", "Quality", "Drive Link"]
+            writer = csv.DictWriter(report, fieldnames=report_fields)
+            writer.writeheader()
+            for item in successful_images:
+                writer.writerow({
+                    "Output Name": item["name"],
+                    "Original Name": item["original_name"],
+                    "Original Resolution": item["original_resolution"],
+                    "Final Canvas": item["final_canvas"],
+                    "Size (KB)": item["size_kb"],
+                    "Quality": item["quality"],
+                    "Drive Link": item.get("drive_url", ""),
+                })
+            st.download_button(
+                "Download Drive Upload Report (.CSV)",
+                data=report.getvalue().encode("utf-8-sig"),
+                file_name="Shopee_Image_Drive_Upload_Report.csv",
+                mime="text/csv",
+            )
+            st.caption("If a row has a blank Drive Link, check the failed-row details below; its image may have processed but failed to upload.")
         else:
-            st.caption("Connect your company Google Workspace account to upload each compressed MP4 directly to Drive.")
-            try:
-                auth_url = _drive_authorization_url()
-                # Use a same-tab top-level link so the OAuth callback can return to this browser session.
-                components.html(
-                    '<a href="' + auth_url + '" target="_blank" rel="noopener noreferrer" '
-                    'style="display:inline-block;padding:0.6rem 1rem;border-radius:0.5rem;'
-                    'background:#ff4b4b;color:white;text-decoration:none;font-weight:600;">'
-                    'Connect Google Drive</a>',
-                    height=55,
-                )
-            except Exception as exc:
-                st.warning(str(exc))
-    drive_folder_id = st.text_input("Google Drive destination folder ID (optional)",
-        placeholder="Leave blank to upload to My Drive root",
-        help="Open the destination folder in Google Drive and copy the text after /folders/ in its URL. The folder must be accessible to the account you connect.",
-        key="drive_folder_id")
-    output_destination = st.radio("Video output destination",
-        ["Download ZIP", "Upload directly to Google Drive"],
-        index=1 if drive_connected else 0, horizontal=True, key="video_output_destination")
-    upload_directly = output_destination == "Upload directly to Google Drive"
-    if upload_directly and not drive_connected:
-        st.warning("Connect Google Drive above before starting a direct upload.")
-    st.info("Example spreadsheet headers: Video link | Video name")
-    video_excel = st.file_uploader("Upload Excel/CSV with “Video link” and “Video name” columns", type=["xlsx", "xlsm", "csv"], key="server_video_excel_upload")
-    if video_excel is not None and st.button(
-        "Upload and Compress Videos to Drive" if upload_directly else "Download and Compress Videos",
-        type="primary", key="server_video_process", disabled=(upload_directly and not drive_connected)):
-        try:
-            with st.spinner("Downloading, compressing, and uploading videos..." if upload_directly else "Downloading and compressing videos..."):
-                result_data, successful_videos, failed_rows = _process_video_server_side(
-                    video_excel, upload_to_drive=upload_directly, drive_folder_id=drive_folder_id)
-            st.success(f"Processed {len(successful_videos)} video(s); {len(failed_rows)} row(s) failed.")
-            if upload_directly:
-                st.download_button("Download Drive Upload Report (.CSV)", data=result_data, file_name="Shopee_Drive_Upload_Report.csv", mime="text/csv")
-            else:
-                st.download_button("Download MP4 Videos + Audit Log (.ZIP)", data=result_data, file_name="Shopee_Compressed_Videos_From_Excel.zip", mime="application/zip")
-            if failed_rows:
-                with st.expander(f"View failed rows ({len(failed_rows)})", expanded=True):
-                    for failure in failed_rows:
-                        st.code(failure, language=None)
-            if successful_videos:
-                st.dataframe([{"Output Name": item["name"], "Original Resolution": item["original_resolution"],
-                    "Duration (seconds)": item["duration_seconds"], "Size (MB)": item["size_mb"], "Format": item["format"],
-                    **({"Drive Link": item["drive_url"]} if upload_directly else {})}
-                    for item in successful_videos], use_container_width=True)
-        except Exception as exc:
-            st.error(f"Could not process this spreadsheet: {exc}")
+            st.download_button(
+                "Download Optimized Images + Audit Log (.ZIP)",
+                data=zip_data,
+                file_name="Shopee_Optimized_Images_From_Excel.zip",
+                mime="application/zip",
+            )
+        if failed_rows:
+            with st.expander(f"View failed rows ({len(failed_rows)})", expanded=True):
+                st.text("\n".join(failed_rows))
+        if successful_images:
+            st.dataframe([{
+                "Output Name": item["name"],
+                "Original Resolution": item["original_resolution"],
+                "Final Canvas": item["final_canvas"],
+                "Size (KB)": item["size_kb"],
+                "Quality": item["quality"],
+                "Upscaled": item["upscaled"],
+                "White Background": item["white_background_detected"],
+                "May Be Stretched": item["may_be_stretched"],
+                **({"Drive Link": item.get("drive_url", "")} if upload_images_to_drive else {}),
+                "Comment": item["background_note"],
+            } for item in successful_images], use_container_width=True)
+    except Exception as exc:
+        st.error(f"Could not process this spreadsheet: {exc}")
 
 
 # 2. Inject HTML Canvas Tool into Streamlit
