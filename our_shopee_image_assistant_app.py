@@ -211,15 +211,29 @@ def _safe_output_name(value, fallback, max_length=200):
 
 def _optimize_image_bytes(image_bytes, output_name):
     with Image.open(io.BytesIO(image_bytes)) as source:
-        image = ImageOps.exif_transpose(source).convert("RGB")
-        orig_w, orig_h = image.size
-        # Enlarge low-resolution images to at least 1000 px on their longest side.
+        source = ImageOps.exif_transpose(source)
+        orig_w, orig_h = source.size
+        # Find visible product bounds before compositing so transparent padding does not
+        # make the product appear tiny. Only alpha-empty outer margins are cropped.
+        rgba = source.convert("RGBA")
+        alpha = rgba.getchannel("A")
+        visible_alpha = alpha.point(lambda value: 255 if value > 8 else 0)
+        bounds = visible_alpha.getbbox()
+        if bounds:
+            rgba = rgba.crop(bounds)
+        # Composite transparency onto white before converting to RGB/WebP.
+        white = Image.new("RGBA", rgba.size, "white")
+        white.alpha_composite(rgba)
+        image = white.convert("RGB")
+        product_w, product_h = image.size
+
+        # Enlarge low-resolution product content to at least 1000 px on its longest side.
         # LANCZOS interpolation and mild sharpening improve perceived crispness but cannot recreate missing detail.
-        was_upscaled = max(orig_w, orig_h) < 1000
+        was_upscaled = max(product_w, product_h) < 1000
         if was_upscaled:
-            scale = 1000 / max(orig_w, orig_h)
+            scale = 1000 / max(product_w, product_h)
             if scale > 1:
-                image = image.resize((max(1, round(orig_w * scale)), max(1, round(orig_h * scale))), Image.Resampling.LANCZOS)
+                image = image.resize((max(1, round(product_w * scale)), max(1, round(product_h * scale))), Image.Resampling.LANCZOS)
                 image = image.filter(ImageFilter.UnsharpMask(radius=1.2, percent=115, threshold=3))
 
         sample = image.copy()
@@ -228,8 +242,7 @@ def _optimize_image_bytes(image_bytes, output_name):
         edges = [px[x, 0] for x in range(sample.width)] + [px[x, sample.height - 1] for x in range(sample.width)] + [px[0, y] for y in range(sample.height)] + [px[sample.width - 1, y] for y in range(sample.height)]
         has_white_background = sum(1 for r, g, b in edges if r >= 245 and g >= 245 and b >= 245) / max(1, len(edges)) >= 0.90
         canvas = Image.new("RGB", (1000, 1000), "white")
-        # Always fit the full source image inside the square canvas without distortion.
-        # Background colour must never determine whether the image is stretched.
+        # Fit the visible product inside the square canvas without distortion.
         image.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
         canvas.paste(image, ((1000 - image.width) // 2, (1000 - image.height) // 2))
         may_be_stretched = False
@@ -849,26 +862,52 @@ HTML_CONTENT = """
                 img.onload = async () => {
                     const origW = img.width;
                     const origH = img.height;
-                    const wasUpscaled = Math.max(origW, origH) < 1000;
+                    // Inspect alpha before drawing onto white; crop only transparent outer margins.
+                    const alphaCanvas = document.createElement('canvas');
+                    alphaCanvas.width = origW;
+                    alphaCanvas.height = origH;
+                    const alphaCtx = alphaCanvas.getContext('2d', { willReadFrequently: true });
+                    alphaCtx.drawImage(img, 0, 0);
+                    const rgba = alphaCtx.getImageData(0, 0, origW, origH).data;
+                    let minX = origW, minY = origH, maxX = -1, maxY = -1;
+                    for (let y = 0; y < origH; y++) {
+                        for (let x = 0; x < origW; x++) {
+                            if (rgba[(y * origW + x) * 4 + 3] > 8) {
+                                if (x < minX) minX = x;
+                                if (x > maxX) maxX = x;
+                                if (y < minY) minY = y;
+                                if (y > maxY) maxY = y;
+                            }
+                        }
+                    }
+                    const cropX = maxX >= minX ? minX : 0;
+                    const cropY = maxY >= minY ? minY : 0;
+                    const productW = maxX >= minX ? maxX - minX + 1 : origW;
+                    const productH = maxY >= minY ? maxY - minY + 1 : origH;
+                    const wasUpscaled = Math.max(productW, productH) < 1000;
 
-                    let srcW = origW;
-                    let srcH = origH;
-                    let canvasSource = img;
+                    let srcW = productW;
+                    let srcH = productH;
+                    let canvasSource = document.createElement('canvas');
+                    canvasSource.width = srcW;
+                    canvasSource.height = srcH;
+                    const cropCtx = canvasSource.getContext('2d');
+                    cropCtx.drawImage(img, cropX, cropY, productW, productH, 0, 0, srcW, srcH);
 
                     if (wasUpscaled) {
-                        // Enlarge low-resolution images to 1000 px on their longest side.
+                        // Enlarge low-resolution product content to 1000 px on its longest side.
                         // Interpolation improves size/smoothness but cannot invent missing detail.
-                        const scale = 1000 / Math.max(origW, origH);
+                        const scale = 1000 / Math.max(srcW, srcH);
                         if (scale > 1) {
-                            srcW = Math.max(1, Math.round(origW * scale));
-                            srcH = Math.max(1, Math.round(origH * scale));
+                            srcW = Math.max(1, Math.round(srcW * scale));
+                            srcH = Math.max(1, Math.round(srcH * scale));
                             const upCanvas = document.createElement('canvas');
                             upCanvas.width = srcW;
                             upCanvas.height = srcH;
                             const uCtx = upCanvas.getContext('2d');
                             uCtx.imageSmoothingEnabled = true;
                             uCtx.imageSmoothingQuality = 'high';
-                            uCtx.drawImage(img, 0, 0, srcW, srcH);
+                            uCtx.drawImage(canvasSource, 0, 0, srcW, srcH);
                             canvasSource = upCanvas;
                         }
                     }
@@ -878,6 +917,7 @@ HTML_CONTENT = """
                     canvas.height = 1000;
                     const ctx = canvas.getContext('2d');
 
+                    // Alpha is flattened onto white before any RGB/WebP encoding.
                     ctx.fillStyle = '#FFFFFF';
                     ctx.fillRect(0, 0, 1000, 1000);
 
