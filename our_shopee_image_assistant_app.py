@@ -925,6 +925,8 @@ HTML_CONTENT = """
                     sampleCanvas.width = 100;
                     sampleCanvas.height = 100;
                     const sampleCtx = sampleCanvas.getContext('2d');
+                    sampleCtx.fillStyle = '#FFFFFF';
+                    sampleCtx.fillRect(0, 0, 100, 100);
                     sampleCtx.drawImage(canvasSource, 0, 0, 100, 100);
                     const sampleData = sampleCtx.getImageData(0, 0, 100, 100).data;
                     let edgePixels = 0;
