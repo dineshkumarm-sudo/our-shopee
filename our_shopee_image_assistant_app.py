@@ -202,7 +202,8 @@ def _download_image(url):
 
 def _safe_output_name(value, fallback, max_length=200):
     name = str(value or "").strip()
-    name = __import__("re").sub(r"\.[^./\\]+$", "", name)
+    # Remove only a recognized image extension. Preserve meaningful dots in product names and SKUs.
+    name = __import__("re").sub(r"\.(?:jpe?g|png|webp|bmp|gif|tiff?)$", "", name, flags=__import__("re").IGNORECASE)
     name = __import__("re").sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).rstrip(". ").strip()
     name = name or fallback
     return name[:max_length].rstrip(". ") or fallback
@@ -724,7 +725,8 @@ HTML_CONTENT = """
 
         function safeOutputBaseName(value, fallback, maxLength = 200) {
             let name = String(value ?? '').trim();
-            name = name.replace(/\.[^./\\]+$/, '');
+            // Remove only a recognized image extension. Preserve meaningful dots in product names and SKUs.
+            name = name.replace(/\.(?:jpe?g|png|webp|bmp|gif|tiff?)$/i, '');
             name = name.replace(/[\\/:*?"<>|\x00-\x1F]/g, '_').replace(/[. ]+$/g, '').trim();
             name = name || fallback || 'image';
             return name.slice(0, maxLength).replace(/[. ]+$/g, '') || fallback || 'image';
