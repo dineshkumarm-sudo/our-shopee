@@ -227,15 +227,16 @@ def _optimize_image_bytes(image_bytes, output_name):
         edges = [px[x, 0] for x in range(sample.width)] + [px[x, sample.height - 1] for x in range(sample.width)] + [px[0, y] for y in range(sample.height)] + [px[sample.width - 1, y] for y in range(sample.height)]
         has_white_background = sum(1 for r, g, b in edges if r >= 245 and g >= 245 and b >= 245) / max(1, len(edges)) >= 0.90
         canvas = Image.new("RGB", (1000, 1000), "white")
-        if has_white_background:
-            image.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
-            canvas.paste(image, ((1000 - image.width) // 2, (1000 - image.height) // 2))
-            may_be_stretched = False
-            background_note = "White background detected; aspect ratio preserved."
-        else:
-            canvas.paste(image.resize((1000, 1000), Image.Resampling.LANCZOS), (0, 0))
-            may_be_stretched = True
-            background_note = "WARNING: Non-white background detected; image may be stretched to 1000x1000."
+        # Always fit the full source image inside the square canvas without distortion.
+        # Background colour must never determine whether the image is stretched.
+        image.thumbnail((1000, 1000), Image.Resampling.LANCZOS)
+        canvas.paste(image, ((1000 - image.width) // 2, (1000 - image.height) // 2))
+        may_be_stretched = False
+        background_note = (
+            "White background detected; aspect ratio preserved."
+            if has_white_background
+            else "Non-white background detected; aspect ratio preserved with white canvas padding."
+        )
 
         # Compress the already-composed square canvas so background handling is retained.
         image = canvas
@@ -903,17 +904,15 @@ HTML_CONTENT = """
                     const hasWhiteBackground = whiteEdgePixels / Math.max(1, edgePixels) >= 0.90;
                     let mayBeStretched = false;
                     let backgroundNote = '';
-                    if (hasWhiteBackground) {
-                        const scale = Math.min(1000 / srcW, 1000 / srcH);
-                        const fitW = srcW * scale;
-                        const fitH = srcH * scale;
-                        ctx.drawImage(canvasSource, (1000 - fitW) / 2, (1000 - fitH) / 2, fitW, fitH);
-                        backgroundNote = 'White background detected; aspect ratio preserved.';
-                    } else {
-                        ctx.drawImage(canvasSource, 0, 0, 1000, 1000);
-                        mayBeStretched = true;
-                        backgroundNote = 'WARNING: Non-white background detected; image may be stretched to 1000x1000.';
-                    }
+                    // Always preserve the source aspect ratio, regardless of background colour.
+                    const fitScale = Math.min(1000 / srcW, 1000 / srcH);
+                    const fitW = srcW * fitScale;
+                    const fitH = srcH * fitScale;
+                    ctx.drawImage(canvasSource, (1000 - fitW) / 2, (1000 - fitH) / 2, fitW, fitH);
+                    mayBeStretched = false;
+                    backgroundNote = hasWhiteBackground
+                        ? 'White background detected; aspect ratio preserved.'
+                        : 'Non-white background detected; aspect ratio preserved with white canvas padding.'
 
                     let quality = 0.92;
                     let blob = null;
